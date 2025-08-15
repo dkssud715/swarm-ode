@@ -182,7 +182,7 @@ class Warehouse(gym.Env):
 
         self.action_size = len(self.action_id_to_coords_map) + 1
         self.action_space = spaces.Tuple(tuple(self.num_agents * [spaces.Discrete(self.action_size)]))
-        print(self.grid_size, len(self.action_id_to_coords_map)-len(self.goals))
+        # print(self.grid_size, len(self.action_id_to_coords_map)-len(self.goals))
 
         self.observation_space_mapper = observation_map[observation_type](
             self.num_agvs,
@@ -191,7 +191,7 @@ class Warehouse(gym.Env):
             len(self.action_id_to_coords_map)-len(self.goals),
             normalised_coordinates,
         )
-        # print("OBservation space mapper:", self.observation_space_mapper.type)
+        # print("Observation space mapper:", self.observation_space_mapper.type)
         self.observation_space = spaces.Tuple(tuple(self.observation_space_mapper.ma_spaces))
 
         self.request_queue_size = request_queue_size
@@ -220,7 +220,7 @@ class Warehouse(gym.Env):
             self._highway_lanes + (self.column_width  + self._highway_lanes) * shelf_columns,
         )
         self.grid = np.zeros((len(CollisionLayers), *self.grid_size), dtype=np.int32)
-
+        
         def get_highway_lanes_indices(axis_size, step):
             return [
                 i + j
@@ -243,7 +243,7 @@ class Warehouse(gym.Env):
         self.num_goals = len(self.goals)
 
         self.highways = np.zeros(self.grid_size, dtype=np.int32)
-        self.action_id_to_coords_map = {i+1: (x, y) for i, (y, x) in enumerate(self.goals)}
+        self.action_id_to_coords_map = {i+1: (y, x) for i, (x, y) in enumerate(self.goals)}
         item_loc_index=len(self.action_id_to_coords_map)+1
         for x in range(self.grid_size[1]):
             for y in range(self.grid_size[0]):
@@ -268,8 +268,8 @@ class Warehouse(gym.Env):
         Parameters:
         - care_for_agents (bool): Whether to consider other agents in the grid.
         - agent (Agent): The agent for which the path is being calculated.
-        - start (tuple): The starting coordinates (x, y) of the agent.
-        - goal (tuple): The goal coordinates (x, y) for the agent.
+        - start (tuple): The starting coordinates (y, x) of the agent.
+        - goal (tuple): The goal coordinates (y, x) for the agent.
 
         Returns:
         - List of tuples representing the path from start to goal, or an empty list if no path is found.

@@ -18,6 +18,7 @@ class MultiAgentPartialObservationSpace(MultiAgentBaseObservationSpace):
         self._current_agvs_agents_info = []
         self._current_pickers_agents_info = []
         self._current_shelves_info = []
+        self._rack_locations = []
         ma_spaces = []
         for obs_length in self.agv_obs_lengths + self.picker_obs_lengths:
             ma_spaces += [
@@ -85,8 +86,9 @@ class MultiAgentPartialObservationSpace(MultiAgentBaseObservationSpace):
 
         # Extract shelves info
         for group in environment.rack_groups:
-            for (x, y) in group:
-                id_shelf = environment.grid[CollisionLayers.SHELVES, x, y]
+            for (x, y) in group: # (y, x)
+                id_shelf = environment.grid[CollisionLayers.SHELVES, x, y] # (y, x)
+                self._rack_locations.append((y, x)) #(x, y)
                 if id_shelf!=0:
                     self._current_shelves_info.extend([1.0 , int(environment.shelfs[id_shelf - 1] in environment.request_queue)])
                 else:
@@ -106,3 +108,6 @@ class MultiAgentPartialObservationSpace(MultiAgentBaseObservationSpace):
                 if agent_id != agent.id - 1:
                     obs.write(agent_info)
         return obs.vector
+    
+    def get_rack_locations(self):
+        return self._rack_locations
