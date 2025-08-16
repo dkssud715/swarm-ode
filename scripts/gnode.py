@@ -599,7 +599,7 @@ env = gym.make("tarware-large-19agvs-9pickers-partialobs-v1")
 
 agent = GraphMARL_DQN(
     node_dims=node_dims,
-    action_size=env.action_space,
+    action_size=env.unwrapped.action_space,
     lr=1e-3,
     gamma=0.99
 )

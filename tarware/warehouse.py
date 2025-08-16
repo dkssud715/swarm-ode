@@ -181,6 +181,7 @@ class Warehouse(gym.Env):
         self.max_steps = max_steps
 
         self.action_size = len(self.action_id_to_coords_map) + 1
+        print(f"Warehouse action size: {self.action_size}, action_id_to_coords_map: {len(self.action_id_to_coords_map)}")
         self.action_space = spaces.Tuple(tuple(self.num_agents * [spaces.Discrete(self.action_size)]))
         # print(self.grid_size, len(self.action_id_to_coords_map)-len(self.goals))
 
@@ -193,7 +194,9 @@ class Warehouse(gym.Env):
         )
         # print("Observation space mapper:", self.observation_space_mapper.type)
         self.observation_space = spaces.Tuple(tuple(self.observation_space_mapper.ma_spaces))
-
+        # print(len(self.action_id_to_coords_map.values()))
+        # print(self.grid_size)
+        # print(len(self.goals))
         self.request_queue_size = request_queue_size
         self.request_queue = []
         self.rack_groups = find_sections(list([loc for loc in self.action_id_to_coords_map.values() if (loc[1], loc[0]) not in self.goals]))
