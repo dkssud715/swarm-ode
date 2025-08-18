@@ -16,13 +16,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 
-from tarware.gnode import gnode_episode
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
-from tarware.utils.utils import flatten_list, split_list
-from tarware.warehouse import Agent, AgentType
-from tarware.definitions import (Action, AgentType, Direction,
-                                 RewardType, CollisionLayers)
-from tarware.spaces.MultiAgentBaseObservationSpace import MultiAgentBaseObservationSpace
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
@@ -69,7 +63,7 @@ def info_statistics(infos, global_episode_return, episode_returns):
 class HeteroGraphODENetwork(nn.Module):
     """Heterogeneous Graph Neural ODE for MARL"""
     
-    def __init__(self, node_dims, hidden_dim=64, num_layers=2, ode_hidden_dim=32):
+    def __init__(self, node_dims, action_size, hidden_dim=64, num_layers=2, ode_hidden_dim=32):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.ode_hidden_dim = ode_hidden_dim
@@ -104,13 +98,13 @@ class HeteroGraphODENetwork(nn.Module):
         self.agv_action_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)  # Q-value for each possible action
+            nn.Linear(hidden_dim // 2, action_size)  # Q-value for each possible action
         )
         
         self.picker_action_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)  # Q-value for each possible action
+            nn.Linear(hidden_dim // 2, action_size)  # Q-value for each possible action
         )
         
     def forward(self, hetero_data, integration_time=1.0):
@@ -185,8 +179,8 @@ class GraphMARL_DQN:
         self.epsilon_min = epsilon_min
         
         # Neural networks
-        self.q_network = HeteroGraphODENetwork(node_dims)
-        self.target_network = HeteroGraphODENetwork(node_dims)
+        self.q_network = HeteroGraphODENetwork(node_dims, action_size)
+        self.target_network = HeteroGraphODENetwork(node_dims, action_size)
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
         
         # Experience replay
@@ -249,6 +243,9 @@ class GraphMARL_DQN:
         total_loss = 0
         for state, actions, rewards, next_state, dones in batch:
             # Current Q values
+            # print(f"State node counts: {[x.size(0) if hasattr(x, 'size') else len(x) for x in state.x_dict.values()]}")
+            # print(f"Max edge indices: {[edge_idx.max().item() for edge_idx in state.edge_index_dict.values()]}")
+
             current_output = self.q_network(state)
             
             # Target Q values
@@ -285,10 +282,13 @@ class GraphMARL_DQN:
             self.epsilon *= self.epsilon_decay
             
     def _compute_agent_loss(self, current_q, next_q, actions, rewards, dones):
-        """Compute DQN loss for a group of agents"""
+        """Compute DQN loss for a group of agents"""                         
         current_q_values = current_q.gather(1, torch.tensor(actions).unsqueeze(1))
         next_q_values = next_q.max(1)[0].detach()
-        target_q_values = torch.tensor(rewards) + (self.gamma * next_q_values * (1 - torch.tensor(dones)))
+
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        dones_tensor = torch.tensor(dones, dtype=torch.float32)
+        target_q_values = rewards_tensor + (self.gamma * next_q_values * (1 - dones_tensor))
         
         return nn.MSELoss()(current_q_values.squeeze(), target_q_values)
 
@@ -321,9 +321,7 @@ class MultiAgentGraphConverter:
         self.edge_features = None
         self.node_types = None
 
-        self.obs_lengths = [self.obs_length for _ in range(self.num_agents)]
-        self._current_agents_info = []
-        self._current_shelves_info = []
+        # self.obs_lengths = [self.obs_length for _ in range(self.num_agents)]
         self.position_to_sections = {}
 
     def process_coordinates(self, coords):
@@ -332,13 +330,14 @@ class MultiAgentGraphConverter:
         else:
             return coords
 
-    def _build_graph_from_observation(self, observation, position_to_sections):
-        self.num_location_nodes = len(self._rack_locations)
-
+    def _build_graph_from_observation(self, observation, rack_locations):
+        self.num_location_nodes = len(rack_locations)
+        self._rack_locations = []
+        self._rack_locations = rack_locations
         agv_features = []
         picker_features = []
         location_features = []
-        self.position_to_sections = position_to_sections
+        self.position_to_sections = {}
         # Extract node features from current_agents_info
         agv_count= 0
         picker_count = 0
@@ -346,25 +345,26 @@ class MultiAgentGraphConverter:
         for agent_id, obs in enumerate(observation):
             if agent_id < self.num_agv_nodes:
                 agv_feature = observation[agent_id][:self.agv_feature_dim].tolist()
-                self._current_agents_info[agent_id] = agv_feature
+                self._current_agents_info.append(agv_feature)
                 agv_features.append(agv_feature)
                 agv_count += 1
             else:
                 picker_feature = observation[agent_id][:self.picker_feature_dim].tolist()
-                self._current_agents_info[agent_id] = picker_feature
+                self._current_agents_info.append(picker_feature)
                 picker_features.append(picker_feature)
                 picker_count += 1
         
         # Extract task features from current_shelves_info
-        location_features = []
-        shelf_data = observation[0][7+4*(self.num_agvs-1):]  # Start after AGV features
+        shelf_data = observation[0][7+4*(self.num_agv_nodes+self.num_picker_nodes-1):]  # Start after AGV features
         for i in range(0, len(shelf_data), 2):
             location_features.append([shelf_data[i], shelf_data[i+1]])
+            self._current_shelves_info.extend([shelf_data[i], shelf_data[i+1]])  # has_shelf, is_requested
+        # print(f"length shelf_data: {len(shelf_data)}")
+        # print(f"length self._current_shelves_info: {len(self._current_shelves_info)}")
         # build edges dynamically based on the environment
-        self.edge_list = self._build_edges(env) #  edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges]
+        self.edge_list = self._build_edges() #  edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges]
 
-        for group_idx, group in enumerate(self._rack_locations):
-            for (y, x) in group:
+        for (x, y, group_idx) in self._rack_locations:
                 self.position_to_sections[(x, y)] = group_idx
 
         data = HeteroData()
@@ -381,6 +381,7 @@ class MultiAgentGraphConverter:
         else:
             data['picker'].num_nodes = 0
             data['picker'].x = torch.empty((0, self.picker_feature_dim), dtype=torch.float32)
+
         if location_features:
             data['location'].num_nodes = self.num_location_nodes
             data['location'].x = torch.tensor(location_features, dtype=torch.float32)
@@ -415,7 +416,8 @@ class MultiAgentGraphConverter:
 
         return data
     
-    def _build_edges(self, env):
+    def _build_edges(self):
+        """
         edge_list = []
 
         # AGV-to-Task Edges
@@ -430,6 +432,26 @@ class MultiAgentGraphConverter:
         # Convert to arrays
         edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges, picker2agv_edges]
         return edge_list
+        """
+        # AGV-to-Task Edges
+        agv2location_edges, location2agv_edges = self._build_agv_to_location_edges()
+        # print(f"AGV2Location: {max([e[0] for e in agv2location_edges]) if agv2location_edges else 'empty'} -> {max([e[1] for e in agv2location_edges]) if agv2location_edges else 'empty'}")
+        
+        # AGV-to-AGV Edges  
+        agv2agv_edges = self._build_agv_to_agv_edges()
+        # print(f"AGV2AGV: {max([e[0] for e in agv2agv_edges]) if agv2agv_edges else 'empty'} -> {max([e[1] for e in agv2agv_edges]) if agv2agv_edges else 'empty'}")
+        
+        # Picker-to-Task Edges
+        picker2location_edges = self._build_picker_to_location_edges()
+        # print(f"Picker2Location: {max([e[0] for e in picker2location_edges]) if picker2location_edges else 'empty'} -> {max([e[1] for e in picker2location_edges]) if picker2location_edges else 'empty'}")
+        
+        # AGV-to-Picker Edges
+        agv2picker_edges, picker2agv_edges = self._build_agv_to_picker_edges()
+        # print(f"AGV2Picker: {max([e[0] for e in agv2picker_edges]) if agv2picker_edges else 'empty'} -> {max([e[1] for e in agv2picker_edges]) if agv2picker_edges else 'empty'}")
+        
+        # print(f"Current nodes - AGV: {self.num_agv_nodes}, Picker: {self.num_picker_nodes}, Location: {self.num_location_nodes}")
+        edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges, picker2agv_edges]
+        return edge_list       
 
     def _build_agv_to_location_edges(self):
         agv2location_edges = []
@@ -448,12 +470,12 @@ class MultiAgentGraphConverter:
                         break
             else:
                 for location_idx, _ in enumerate(self._rack_locations):
-                    location_info = self._current_shelves_info[location_idx * 3: (location_idx + 1) * 3]
+                    location_info = self._current_shelves_info[location_idx * 2: (location_idx + 1) * 2]
                     has_shelf = location_info[0]
                     is_requested = location_info[1]
                     if has_shelf and is_requested:
-                        agv2location_edges.extend([(agv_idx, loc_idx)])
-                        location2agv_edges.extend([(loc_idx, agv_idx)])
+                        agv2location_edges.extend([(agv_idx, location_idx)])
+                        location2agv_edges.extend([(location_idx, agv_idx)])
 
         return agv2location_edges, location2agv_edges
     
@@ -475,6 +497,7 @@ class MultiAgentGraphConverter:
 
                 has_target_i = not (target_i[0] == 0 and target_i[1] == 0)
                 has_target_j = not (target_j[0] == 0 and target_j[1] == 0)
+                same_section = False
                 if has_target_i and has_target_j:
                     same_section = self._check_same_rack_group(target_i, target_j)
 
@@ -494,10 +517,10 @@ class MultiAgentGraphConverter:
             picker_target = np.array([agent_info[3], agent_info[2]])  # target_x, target_y
             has_target = not (picker_target[0] == 0 and picker_target[1] == 0)
             
-            picker_section = self.position_to_sections.get(picker_pos, None)
+            picker_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
 
             for loc_idx, rack_pos in enumerate(self._rack_locations): # rack_pos is (x, y) format
-                shelf_info = self._current_shelves_info[loc_idx * 3: (loc_idx + 1) * 3]
+                shelf_info = self._current_shelves_info[loc_idx * 2: (loc_idx + 1) * 2]
                 loc_section = self.position_to_sections.get(rack_pos, None)
                 has_shelf = shelf_info[0]
                 is_requested = shelf_info[1]
@@ -534,29 +557,32 @@ class MultiAgentGraphConverter:
                 # Condition 2: Same target section coordination
                 has_picker_taget = not (picker_target[0] == 0 and picker_target[1] == 0)
                 has_agv_target = not (agv_target[0] == 0 and agv_target[1] == 0)
+                same_target = False
+                same_target_section = False
+                agv_target_in_picker_section = False
                 if has_agv_target and has_picker_taget:
                     same_target = picker_target[0] == agv_target[0] and picker_target[1] == agv_target[1]
                     if not same_target:
-                        agv_target_section = self.position_to_sections.get(agv_target, None)
-                        picker_target_section = self.position_to_sections.get(picker_target, None)
+                        agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
+                        picker_target_section = self.position_to_sections.get((picker_target[0], picker_target[1]), None)
                         if agv_target_section is not None and picker_target_section is not None:
                             same_target_section = agv_target_section == picker_target_section
 
                 else:
-                    picker_current_section = self.position_to_sections.get(picker_pos, None)
+                    picker_current_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
                     if has_agv_target:
-                        agv_target_section = self.position_to_sections.get(agv_target, None)
+                        agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
                         agv_target_in_picker_section = picker_current_section == agv_target_section
                 
                 if close_proximity or same_target or same_target_section or agv_target_in_picker_section:
-                    agv2picker_edges.append((agv_idx, self.num_agv_nodes + picker_idx))
-                    picker2agv_edges.append((self.num_agv_nodes + picker_idx, agv_idx))
+                    agv2picker_edges.append((agv_idx, picker_idx))
+                    picker2agv_edges.append((picker_idx, agv_idx))
         
         return agv2picker_edges, picker2agv_edges
     
     def _check_same_rack_group(self, pos_i, pos_j):
-        group_i = self.position_to_sections[pos_i]
-        group_j = self.position_to_sections[pos_j]
+        group_i = self.position_to_sections[(pos_i[0], pos_i[1])]
+        group_j = self.position_to_sections[(pos_j[0], pos_j[1])]
         return (group_i is not None and group_j is not None and group_i == group_j)
 
 # Initialize model
@@ -565,11 +591,11 @@ node_dims = {
     'picker': 4,  # Picker feature dimension
     'location': 2  # Location feature dimension
 }
-env = gym.make("tarware-medium-40avgs-10pickers-partialobs-v1")
-
+env = gym.make("tarware-large-19agvs-9pickers-partialobs-v1")
+print(env.unwrapped.action_size)
 agent = GraphMARL_DQN(
     node_dims=node_dims,
-    action_size=env.action_size,
+    action_size=env.unwrapped.action_size,
     lr=1e-3,
     gamma=0.99
 )
@@ -586,24 +612,25 @@ graph_converter = MultiAgentGraphConverter(
 )
 for episode in range(args.num_episodes):
     state = env.reset()
-    rack_locations = env.observation_space_mapper.get_rack_locations()
+    rack_locations = env.unwrapped.observation_space_mapper.get_rack_locations()
     hetero_data = graph_converter._build_graph_from_observation(state, rack_locations)
 
     total_reward = 0
-    episode_returns = np.zeros(env.num_agents, dtype=np.float64)
+    episode_returns = np.zeros(env.unwrapped.num_agents, dtype=np.float64)
     done = False
     step = 0
     all_infos = []
     while not done and step < 1000:  # Max steps per episode
         # Get valid action masks
-        valid_action_masks = env.compute_valid_action_masks()
+        valid_action_masks = env.unwrapped.compute_valid_action_masks()
         
         # Choose actions
         actions = agent.act(hetero_data, valid_action_masks)
         
         # Take environment step
         next_state, rewards, dones, truncated, info = env.step(actions)
-        next_hetero_data = env.observation_space_mapper._build_graph_from_extracted_info(env)
+        next_rack_locations = env.unwrapped.observation_space_mapper.get_rack_locations()
+        next_hetero_data = graph_converter._build_graph_from_observation(next_state, next_rack_locations)
         
         # Store experience
         agent.remember(hetero_data, actions, rewards, next_hetero_data, dones)
@@ -629,10 +656,10 @@ for episode in range(args.num_episodes):
     if episode % 100 == 0:
         avg_score = np.mean(scores)
         print(f"Episode {episode}, Average Score: {avg_score:.2f}, Epsilon: {agent.epsilon:.3f}")
-    last_info = info_statistics(info, total_reward, episode_returns)
+    last_info = info_statistics(all_infos, total_reward, episode_returns)
     last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
     episode_length = len(info)
-    print(f"Completed Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}] | [FPS = {episode_length/(end-start):.2f}]")
+    print(f"Completed Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}]")
     completed_episodes += 1
 
 env.close()
