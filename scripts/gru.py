@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import HeteroConv, SAGEConv
+from torch_geometric.data import Batch
 
 from torchdiffeq import odeint
 
@@ -218,6 +219,7 @@ class COMAActorNetwork(nn.Module):
         log_prob = dist.log_prob(action)
         return action, log_prob
 
+
 class COMACriticNetwork(nn.Module):
     """
     Centralized Critic Network
@@ -261,6 +263,7 @@ class COMACriticNetwork(nn.Module):
         critic_input = torch.cat([global_state, all_actions_one_hot], dim=1)
         
         return self.network(critic_input)
+
 
 class WarehouseCOMA(nn.Module):
     """
@@ -399,6 +402,7 @@ class WarehouseCOMA(nn.Module):
         
         return advantage
 
+
 class COMAAgent:
     """
     COMA Agent for training
@@ -426,51 +430,75 @@ class COMAAgent:
     
     def update(self, batch_data):
         """
-        Update COMA networks using batch of experience
+        Update COMA networks using batch of experience (individual processing)
         """
         # Extract batch data
-        hetero_data_batch = batch_data['hetero_data']
+        hetero_data_list = batch_data['hetero_data']  # List of individual graphs
+        next_hetero_data_list = batch_data['next_hetero_data']
         global_states = batch_data['global_states']
         actions = batch_data['actions']
         rewards = batch_data['rewards']
         next_global_states = batch_data['next_global_states']
         dones = batch_data['dones']
         
+        batch_size = len(hetero_data_list)
+        
         # Compute TD targets for critic
         with torch.no_grad():
             next_q_values = self.coma_network.get_critic_values(next_global_states, actions)
-            td_targets = rewards + self.gamma * next_q_values * (1 - dones)
+            td_targets = rewards + self.gamma * next_q_values.mean(dim=1) * (1 - dones)
         
         # Update critic
         current_q_values = self.coma_network.get_critic_values(global_states, actions)
-        critic_loss = F.mse_loss(current_q_values, td_targets)
+        critic_loss = F.mse_loss(current_q_values.mean(dim=1), td_targets)
         
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
         
-        # Update actors using counterfactual advantage
+        # Update actors using policy gradient (individual processing)
         actor_loss = 0
-        for agent_idx in range(self.coma_network.n_agents):
-            advantage = self.coma_network.compute_counterfactual_advantage(
-                global_states, actions, rewards, agent_idx
-            )
+        
+        for t in range(batch_size):
+            # Get embeddings for this time step
+            hetero_data = hetero_data_list[t]
+            graph_output = self.coma_network.get_embeddings(hetero_data)
             
-            # Get log probability of taken action
-            if agent_idx < self.coma_network.n_agvs:
-                graph_output = self.coma_network.get_embeddings(hetero_data_batch)
-                agent_embedding = graph_output['agv_embeddings'][agent_idx:agent_idx+1]
-                action_probs = self.coma_network.agv_actor.get_action_probs(agent_embedding)
-            else:
-                picker_idx = agent_idx - self.coma_network.n_agvs
-                graph_output = self.coma_network.get_embeddings(hetero_data_batch)
-                agent_embedding = graph_output['picker_embeddings'][picker_idx:picker_idx+1]
-                action_probs = self.coma_network.picker_actor.get_action_probs(agent_embedding)
+            agv_embeddings = graph_output['agv_embeddings']  # [n_agvs, hidden_dim]
+            picker_embeddings = graph_output['picker_embeddings']  # [n_pickers, hidden_dim]
             
-            taken_action = actions[:, agent_idx]
-            log_prob = torch.log(action_probs.gather(1, taken_action.unsqueeze(1)).squeeze())
+            current_actions = actions[t]  # [n_agents]
             
-            actor_loss += -torch.mean(log_prob * advantage.detach())
+            # Compute policy loss for AGVs
+            for agv_idx in range(self.coma_network.n_agvs):
+                if agv_idx < agv_embeddings.size(0):  # Check if this AGV exists
+                    agv_emb = agv_embeddings[agv_idx:agv_idx+1]  # [1, hidden_dim]
+                    action_probs = self.coma_network.agv_actor.get_action_probs(agv_emb)
+                    taken_action = current_actions[agv_idx]
+                    log_prob = torch.log(action_probs[0, taken_action] + 1e-8)
+                    
+                    # Simple advantage using critic values
+                    with torch.no_grad():
+                        advantage = current_q_values[t, agv_idx] - current_q_values[t].mean()
+                    
+                    actor_loss += -log_prob * advantage
+            
+            # Compute policy loss for Pickers
+            for picker_idx in range(self.coma_network.n_pickers):
+                if picker_idx < picker_embeddings.size(0):  # Check if this Picker exists
+                    picker_emb = picker_embeddings[picker_idx:picker_idx+1]  # [1, hidden_dim]
+                    action_probs = self.coma_network.picker_actor.get_action_probs(picker_emb)
+                    taken_action = current_actions[self.coma_network.n_agvs + picker_idx]
+                    log_prob = torch.log(action_probs[0, taken_action] + 1e-8)
+                    
+                    # Simple advantage using critic values
+                    with torch.no_grad():
+                        advantage = current_q_values[t, self.coma_network.n_agvs + picker_idx] - current_q_values[t].mean()
+                    
+                    actor_loss += -log_prob * advantage
+        
+        # Average the actor loss over the batch
+        actor_loss = actor_loss / batch_size
         
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -480,7 +508,7 @@ class COMAAgent:
             'critic_loss': critic_loss.item(),
             'actor_loss': actor_loss.item()
         }
-
+    
 class MultiAgentGraphConverter:
     def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
 
@@ -774,6 +802,39 @@ class MultiAgentGraphConverter:
         group_j = self.position_to_sections[(pos_j[0], pos_j[1])]
         return (group_i is not None and group_j is not None and group_i == group_j)
 
+def extract_global_state(env, hetero_data):
+    """Extract comprehensive global state for COMA critic"""
+    # Get environment's internal state
+    obs_mapper = env.unwrapped.observation_space_mapper
+    
+    global_info = []
+    
+    # 1. All agent states from environment
+    for agv_info in obs_mapper._current_agvs_agents_info:
+        global_info.extend(agv_info)
+    
+    for picker_info in obs_mapper._current_pickers_agents_info:
+        global_info.extend(picker_info)
+    
+    # 2. Complete shelf information
+    global_info.extend(obs_mapper._current_shelves_info)
+    
+    # 3. Graph structure information (dynamic edges)
+    edge_counts = []
+    for edge_type, edge_index in hetero_data.edge_index_dict.items():
+        edge_counts.append(edge_index.size(1))  # Number of edges of each type
+    global_info.extend(edge_counts)
+    
+    # 4. Additional global metrics
+    total_requests = sum(1 for i in range(0, len(obs_mapper._current_shelves_info), 2) 
+                        if obs_mapper._current_shelves_info[i+1] == 1)
+    total_shelves_carried = sum(1 for i in range(0, len(obs_mapper._current_agvs_agents_info)) 
+                               if len(obs_mapper._current_agvs_agents_info[i]) > 0 and obs_mapper._current_agvs_agents_info[i][0] == 1)
+    
+    global_info.extend([total_requests, total_shelves_carried])
+    
+    return torch.tensor(global_info, dtype=torch.float32)
+
 # Initialize model
 node_dims = {
     'agv': 7,  # AGV feature dimension
@@ -782,6 +843,8 @@ node_dims = {
 }
 env = gym.make("tarware-medium-19agvs-9pickers-partialobs-v1")
 print(env.unwrapped.action_size)
+
+# Model setup
 num_agvs = 19
 num_picker = 9
 action_dim = env.unwrapped.action_size
@@ -845,39 +908,6 @@ episode_buffer = {
     'picker_hiddens': []
 }
 
-def extract_global_state(env, hetero_data):
-    """Extract comprehensive global state for COMA critic"""
-    # Get environment's internal state
-    obs_mapper = env.unwrapped.observation_space_mapper
-    
-    global_info = []
-    
-    # 1. All agent states from environment
-    for agv_info in obs_mapper._current_agvs_agents_info:
-        global_info.extend(agv_info)
-    
-    for picker_info in obs_mapper._current_pickers_agents_info:
-        global_info.extend(picker_info)
-    
-    # 2. Complete shelf information
-    global_info.extend(obs_mapper._current_shelves_info)
-    
-    # 3. Graph structure information (dynamic edges)
-    edge_counts = []
-    for edge_type, edge_index in hetero_data.edge_index_dict.items():
-        edge_counts.append(edge_index.size(1))  # Number of edges of each type
-    global_info.extend(edge_counts)
-    
-    # 4. Additional global metrics
-    total_requests = sum(1 for i in range(0, len(obs_mapper._current_shelves_info), 2) 
-                        if obs_mapper._current_shelves_info[i+1] == 1)
-    total_shelves_carried = sum(1 for i in range(0, len(obs_mapper._current_agvs_agents_info)) 
-                               if len(obs_mapper._current_agvs_agents_info[i]) > 0 and obs_mapper._current_agvs_agents_info[i][0] == 1)
-    
-    global_info.extend([total_requests, total_shelves_carried])
-    
-    return torch.tensor(global_info, dtype=torch.float32)
-
 def clear_episode_buffer():
     """Clear episode buffer"""
     for key in episode_buffer.keys():
@@ -939,10 +969,10 @@ for episode in range(args.num_episodes):
         episode_buffer['hetero_data'].append(hetero_data)
         episode_buffer['global_states'].append(global_state)
         episode_buffer['actions'].append(torch.tensor(actions))
-        episode_buffer['rewards'].append(torch.tensor(rewards, dtype=torch.float32))
+        episode_buffer['rewards'].append(torch.tensor(sum(rewards), dtype=torch.float32))  # Convert to scalar
         episode_buffer['next_hetero_data'].append(next_hetero_data)
         episode_buffer['next_global_states'].append(next_global_state)
-        episode_buffer['dones'].append(torch.tensor(dones, dtype=torch.float32))
+        episode_buffer['dones'].append(torch.tensor(float(all(dones)), dtype=torch.float32))  # Convert to scalar
         episode_buffer['agv_hiddens'].append(agv_hidden.clone() if agv_hidden is not None else None)
         episode_buffer['picker_hiddens'].append(picker_hidden.clone() if picker_hidden is not None else None)
         
@@ -959,9 +989,10 @@ for episode in range(args.num_episodes):
     
     # Train COMA after collecting full episode
     if len(episode_buffer['hetero_data']) > 0:
-        # Prepare batch data
+        # Prepare batch data (no batching for graph data)
         batch_data = {
-            'hetero_data': episode_buffer['hetero_data'],
+            'hetero_data': episode_buffer['hetero_data'],  # List of individual graphs
+            'next_hetero_data': episode_buffer['next_hetero_data'],
             'global_states': torch.stack(episode_buffer['global_states']),
             'actions': torch.stack(episode_buffer['actions']),
             'rewards': torch.stack(episode_buffer['rewards']),
