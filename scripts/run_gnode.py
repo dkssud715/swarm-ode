@@ -2,6 +2,8 @@ import gymnasium as gym
 import tarware
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
 import torch.optim as optim
 
 from torch_geometric.data import Data, HeteroData
@@ -61,7 +63,7 @@ def info_statistics(infos, global_episode_return, episode_returns):
     return last_info
 
 class HeteroGraphODENetwork(nn.Module):
-    """Heterogeneous Graph Neural ODE for MARL (Corrected Version)"""
+    """Heterogeneous Graph Neural ODE for MARL """
     
     def __init__(self, node_dims, action_size, hidden_dim=64, num_layers=2, ode_hidden_dim=32):
         super().__init__()
@@ -127,8 +129,8 @@ class HeteroGraphODENetwork(nn.Module):
         # 이제 더 이상 모든 임베딩을 합치지 않습니다.
         t = torch.tensor([0., integration_time], dtype=torch.float32, device=x_dict['agv'].device)
         
-        evolved_agv_embeddings = odeint(self.ode_func_agv, x_dict['agv'], t, method='dopri5')[-1]
-        evolved_picker_embeddings = odeint(self.ode_func_picker, x_dict['picker'], t, method='dopri5')[-1]
+        evolved_agv_embeddings = odeint(self.ode_func_agv, x_dict['agv'], t, method='eulersksms')[-1] # 'dopri5'
+        evolved_picker_embeddings = odeint(self.ode_func_picker, x_dict['picker'], t, method='euler')[-1] # 'dopri5'
         
         # Location 노드는 동적인 상태 변화가 없으므로 ODE를 적용하지 않고 GNN의 결과만 사용합니다.
         final_location_embeddings = x_dict['location']
@@ -145,6 +147,7 @@ class HeteroGraphODENetwork(nn.Module):
             'picker_embeddings': evolved_picker_embeddings,
             'location_embeddings': final_location_embeddings
         }
+
 class ODEFunction(nn.Module):
     """ODE Function for continuous dynamics"""
     
@@ -161,131 +164,365 @@ class ODEFunction(nn.Module):
     def forward(self, t, x):
         return self.net(x)
 
-class GraphMARL_DQN:
-    """Graph-based Multi-Agent Deep Q-Network with Neural ODE"""
+class TypeSpecificActor(nn.Module):
+    """Actor network for specific agent type (AGV or Picker)"""
     
-    def __init__(self, node_dims, action_size, lr=1e-3, gamma=0.99, epsilon=1.0, 
-                 epsilon_decay=0.995, epsilon_min=0.01, memory_size=10000):
+    def __init__(self, embedding_dim, action_size, hidden_dim=64):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_size)
+        )
         
+    def forward(self, embeddings):
+        """
+        Args:
+            embeddings: [num_agents_of_type, embedding_dim]
+        Returns:
+            action_logits: [num_agents_of_type, action_size]
+        """
+        return self.network(embeddings)
+    
+    def get_action_probs(self, embeddings, action_masks=None):
+        """Get action probabilities with masking"""
+        logits = self.forward(embeddings)
+        
+        if action_masks is not None:
+            # Apply action masking
+            logits = logits.masked_fill(~action_masks.bool(), -1e9)
+        
+        return F.softmax(logits, dim=-1)
+    
+    def sample_actions(self, embeddings, action_masks=None):
+        """Sample actions and return log probabilities"""
+        probs = self.get_action_probs(embeddings, action_masks)
+        dist = Categorical(probs)
+        actions = dist.sample()
+        log_probs = dist.log_prob(actions)
+        return actions, log_probs
+
+class TypeSpecificCritic(nn.Module):
+    """Critic network for specific agent type (takes global type state + all type actions)"""
+    
+    def __init__(self, num_agents_of_type, embedding_dim, action_size, hidden_dim=128):
+        super().__init__()
+        self.num_agents = num_agents_of_type
+        self.action_size = action_size
+        
+        # Input: all embeddings + all actions (one-hot)
+        input_dim = num_agents_of_type * (embedding_dim + action_size)
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_agents_of_type)  # Q-value for each agent of this type
+        )
+        
+    def forward(self, embeddings, actions):
+        """
+        Args:
+            embeddings: [num_agents_of_type, embedding_dim]
+            actions: [num_agents_of_type] - discrete actions
+        Returns:
+            q_values: [num_agents_of_type] - Q-value for each agent
+        """
+        # Convert actions to one-hot
+        actions_one_hot = F.one_hot(actions.long(), num_classes=self.action_size).float()
+        
+        # Concatenate embeddings and actions for all agents of this type
+        # Shape: [embedding_dim + action_size] for each agent, then flatten
+        agent_features = torch.cat([embeddings, actions_one_hot], dim=1)  # [num_agents, embedding_dim + action_size]
+        global_input = agent_features.view(-1)  # Flatten to [num_agents * (embedding_dim + action_size)]
+        
+        # Add batch dimension if needed
+        if global_input.dim() == 1:
+            global_input = global_input.unsqueeze(0)
+        
+        q_values = self.network(global_input)  # [1, num_agents]
+        return q_values.squeeze(0)  # [num_agents]
+
+class HeteroGraphActorCriticNetwork(nn.Module):
+    """Graph-based Actor-Critic Network using existing Graph ODE"""
+    
+    def __init__(self, graph_ode_network, num_agvs, num_pickers, action_size, hidden_dim=64):
+        super().__init__()
+        self.graph_network = graph_ode_network  # Your existing HeteroGraphODENetwork
+        self.num_agvs = num_agvs
+        self.num_pickers = num_pickers
+        self.action_size = action_size
+        self.hidden_dim = hidden_dim
+        
+        # Get embedding dimension from graph network
+        embedding_dim = graph_ode_network.hidden_dim
+        
+        # Type-specific actors
+        self.agv_actor = TypeSpecificActor(embedding_dim, action_size, hidden_dim)
+        self.picker_actor = TypeSpecificActor(embedding_dim, action_size, hidden_dim)
+        
+        # Type-specific critics
+        self.agv_critic = TypeSpecificCritic(num_agvs, embedding_dim, action_size, hidden_dim)
+        self.picker_critic = TypeSpecificCritic(num_pickers, embedding_dim, action_size, hidden_dim)
+        
+    def forward(self, hetero_data, integration_time=1.0):
+        """Get embeddings from graph network"""
+        graph_output = self.graph_network(hetero_data, integration_time)
+        return {
+            'agv_embeddings': graph_output['agv_embeddings'],
+            'picker_embeddings': graph_output['picker_embeddings'],
+            'location_embeddings': graph_output['location_embeddings']
+        }
+    
+    def get_actions_and_probs(self, hetero_data, valid_action_masks, training=True):
+        """Get actions and probabilities for all agents"""
+        graph_output = self.forward(hetero_data)
+        
+        agv_embeddings = graph_output['agv_embeddings']  # [num_agvs, embedding_dim]
+        picker_embeddings = graph_output['picker_embeddings']  # [num_pickers, embedding_dim]
+        
+        # Split action masks
+        agv_masks = valid_action_masks[:self.num_agvs] if valid_action_masks is not None else None
+        picker_masks = valid_action_masks[self.num_agvs:] if valid_action_masks is not None else None
+        
+        if training:
+            # Sample actions during training
+            agv_actions, agv_log_probs = self.agv_actor.sample_actions(agv_embeddings, agv_masks)
+            picker_actions, picker_log_probs = self.picker_actor.sample_actions(picker_embeddings, picker_masks)
+            
+            # Combine results
+            all_actions = torch.cat([agv_actions, picker_actions])
+            all_log_probs = torch.cat([agv_log_probs, picker_log_probs])
+            
+            return all_actions, all_log_probs, graph_output
+        else:
+            # Greedy actions during evaluation
+            agv_probs = self.agv_actor.get_action_probs(agv_embeddings, agv_masks)
+            picker_probs = self.picker_actor.get_action_probs(picker_embeddings, picker_masks)
+            
+            agv_actions = torch.argmax(agv_probs, dim=-1)
+            picker_actions = torch.argmax(picker_probs, dim=-1)
+            
+            all_actions = torch.cat([agv_actions, picker_actions])
+            return all_actions, None, graph_output
+    
+    def compute_counterfactual_advantage(self, graph_output, agent_type, agent_idx, actions, critic_type):
+        """
+        Compute COMA counterfactual advantage for specific agent
+        
+        Args:
+            graph_output: Output from graph network
+            agent_type: 'agv' or 'picker'
+            agent_idx: Index within the agent type
+            actions: Actions taken by all agents of this type
+            critic_type: 'agv_critic' or 'picker_critic'
+        """
+        if agent_type == 'agv':
+            embeddings = graph_output['agv_embeddings']
+            critic = self.agv_critic
+        else:
+            embeddings = graph_output['picker_embeddings'] 
+            critic = self.picker_critic
+            
+        # Current Q-value
+        current_q = critic(embeddings, actions)[agent_idx]
+        
+        # Compute counterfactual baseline
+        counterfactual_q_values = []
+        
+        for alt_action in range(self.action_size):
+            # Create counterfactual action vector
+            cf_actions = actions.clone()
+            cf_actions[agent_idx] = alt_action
+            
+            # Get Q-value for counterfactual action
+            cf_q = critic(embeddings, cf_actions)[agent_idx]
+            counterfactual_q_values.append(cf_q)
+        
+        counterfactual_q_values = torch.stack(counterfactual_q_values)  # [action_size]
+        
+        # Get current policy for this agent
+        if agent_type == 'agv':
+            agent_embedding = embeddings[agent_idx:agent_idx+1]
+            action_probs = self.agv_actor.get_action_probs(agent_embedding).squeeze(0)
+        else:
+            agent_embedding = embeddings[agent_idx:agent_idx+1]
+            action_probs = self.picker_actor.get_action_probs(agent_embedding).squeeze(0)
+        
+        # Baseline = expected Q-value under current policy
+        baseline = torch.sum(action_probs * counterfactual_q_values)
+        
+        # Advantage = Q(current action) - baseline
+        advantage = current_q - baseline
+        
+        return advantage
+
+class TypeLevelCOMA:
+    """Type-Level COMA Agent"""
+    
+    def __init__(self, graph_ode_network, num_agvs, num_pickers, action_size, 
+                 lr_actor=1e-3, lr_critic=1e-3, gamma=0.99, memory_size=10000):
+        
+        self.num_agvs = num_agvs
+        self.num_pickers = num_pickers
         self.action_size = action_size
         self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
         
-        # Neural networks
-        self.q_network = HeteroGraphODENetwork(node_dims, action_size)
-        self.target_network = HeteroGraphODENetwork(node_dims, action_size)
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        # Actor-Critic network
+        self.ac_network = HeteroGraphActorCriticNetwork(
+            graph_ode_network, num_agvs, num_pickers, action_size
+        )
+        
+        # Optimizers for each component
+        self.agv_actor_optimizer = optim.Adam(self.ac_network.agv_actor.parameters(), lr=lr_actor)
+        self.picker_actor_optimizer = optim.Adam(self.ac_network.picker_actor.parameters(), lr=lr_actor)
+        self.agv_critic_optimizer = optim.Adam(self.ac_network.agv_critic.parameters(), lr=lr_critic)
+        self.picker_critic_optimizer = optim.Adam(self.ac_network.picker_critic.parameters(), lr=lr_critic)
         
         # Experience replay
         self.memory = deque(maxlen=memory_size)
         
-        # Update target network
-        self.update_target_network()
-        
-    def update_target_network(self):
-        """Copy weights from main network to target network"""
-        self.target_network.load_state_dict(self.q_network.state_dict())
-        
-    def remember(self, state, actions, rewards, next_state, dones):
-        """Store experience in replay buffer"""
-        self.memory.append((state, actions, rewards, next_state, dones))
-        
     def act(self, hetero_data, valid_action_masks, training=True):
-        """Choose actions using epsilon-greedy policy"""
-        if training and np.random.random() <= self.epsilon:
-            # Random action (exploration)
-            actions = []
-            for agent_idx in range(hetero_data['agv'].num_nodes + hetero_data['picker'].num_nodes):
-                if agent_idx < hetero_data['agv'].num_nodes:
-                    # AGV action
-                    valid_actions = np.where(valid_action_masks[agent_idx] == 1)[0]
-                else:
-                    # Picker action  
-                    valid_actions = np.where(valid_action_masks[agent_idx] == 1)[0]
-                actions.append(np.random.choice(valid_actions))
-            return actions
-        
-        # Greedy action (exploitation)
+        """Choose actions for all agents"""
         with torch.no_grad():
-            output = self.q_network(hetero_data)
-            
-            actions = []
-            # AGV actions
-            for i, q_vals in enumerate(output['agv_q_values']):
-                masked_q_vals = q_vals.clone()
-                masked_q_vals[valid_action_masks[i] == 0] = float('-inf')
-                actions.append(masked_q_vals.argmax().item())
-                
-            # Picker actions
-            agv_count = hetero_data['agv'].num_nodes
-            for i, q_vals in enumerate(output['picker_q_values']):
-                agent_idx = agv_count + i
-                masked_q_vals = q_vals.clone()
-                masked_q_vals[valid_action_masks[agent_idx] == 0] = float('-inf')
-                actions.append(masked_q_vals.argmax().item())
-                
-        return actions
+            actions, log_probs, graph_output = self.ac_network.get_actions_and_probs(
+                hetero_data, valid_action_masks, training
+            )
         
+        if training:
+            return actions.cpu().numpy().tolist(), log_probs, graph_output
+        else:
+            return actions.cpu().numpy().tolist(), None, graph_output
+    
+    def remember(self, hetero_data, actions, rewards, next_hetero_data, dones):
+        """Store experience in replay buffer"""
+        self.memory.append((hetero_data, actions, rewards, next_hetero_data, dones))
+    
     def replay(self, batch_size=32):
-        """Train the network on a batch of experiences"""
+        """Train the networks using COMA"""
         if len(self.memory) < batch_size:
-            return
-            
+            return {}
+        
         batch = random.sample(self.memory, batch_size)
         
-        total_loss = 0
-        for state, actions, rewards, next_state, dones in batch:
-            # Current Q values
-            # print(f"State node counts: {[x.size(0) if hasattr(x, 'size') else len(x) for x in state.x_dict.values()]}")
-            # print(f"Max edge indices: {[edge_idx.max().item() for edge_idx in state.edge_index_dict.values()]}")
-
-            current_output = self.q_network(state)
+        total_agv_actor_loss = 0
+        total_picker_actor_loss = 0
+        total_agv_critic_loss = 0
+        total_picker_critic_loss = 0
+        
+        for experience in batch:
+            hetero_data, actions, rewards, next_hetero_data, dones = experience
             
-            # Target Q values
+            # Convert to tensors
+            actions_tensor = torch.tensor(actions, dtype=torch.long)
+            rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+            dones_tensor = torch.tensor(dones, dtype=torch.float32)
+            
+            # Split actions and rewards by type
+            agv_actions = actions_tensor[:self.num_agvs]
+            picker_actions = actions_tensor[self.num_agvs:]
+            agv_rewards = rewards_tensor[:self.num_agvs]
+            picker_rewards = rewards_tensor[self.num_agvs:]
+            agv_dones = dones_tensor[:self.num_agvs]
+            picker_dones = dones_tensor[self.num_agvs:]
+            
+            # Get current and next embeddings
+            current_output = self.ac_network.forward(hetero_data)
+            
             with torch.no_grad():
-                next_output = self.target_network(next_state)
+                next_output = self.ac_network.forward(next_hetero_data)
+            
+            # ============ AGV UPDATES ============
+            if self.num_agvs > 0:
+                # AGV Critic Update
+                current_agv_q = self.ac_network.agv_critic(current_output['agv_embeddings'], agv_actions)
                 
-            # Compute loss for each agent type
-            agv_loss = self._compute_agent_loss(
-                current_output['agv_q_values'], 
-                next_output['agv_q_values'],
-                actions[:state['agv'].num_nodes],
-                rewards[:state['agv'].num_nodes],
-                dones[:state['agv'].num_nodes]
-            )
+                with torch.no_grad():
+                    next_agv_q = self.ac_network.agv_critic(next_output['agv_embeddings'], agv_actions[:self.num_agvs])
+                    agv_targets = agv_rewards + self.gamma * next_agv_q * (1 - agv_dones)
+                
+                agv_critic_loss = F.mse_loss(current_agv_q, agv_targets)
+                
+                self.agv_critic_optimizer.zero_grad()
+                agv_critic_loss.backward(retain_graph=True)
+                self.agv_critic_optimizer.step()
+                
+                total_agv_critic_loss += agv_critic_loss.item()
+                
+                # AGV Actor Update
+                agv_actor_loss = 0
+                for agv_idx in range(self.num_agvs):
+                    advantage = self.ac_network.compute_counterfactual_advantage(
+                        current_output, 'agv', agv_idx, agv_actions, 'agv_critic'
+                    )
+                    
+                    # Get log probability of taken action
+                    agv_embedding = current_output['agv_embeddings'][agv_idx:agv_idx+1]
+                    action_probs = self.ac_network.agv_actor.get_action_probs(agv_embedding)
+                    taken_action = agv_actions[agv_idx]
+                    log_prob = torch.log(action_probs[0, taken_action] + 1e-8)
+                    
+                    agv_actor_loss += -log_prob * advantage.detach()
+                
+                agv_actor_loss = agv_actor_loss / self.num_agvs
+                
+                self.agv_actor_optimizer.zero_grad()
+                agv_actor_loss.backward(retain_graph=True)
+                self.agv_actor_optimizer.step()
+                
+                total_agv_actor_loss += agv_actor_loss.item()
             
-            picker_loss = self._compute_agent_loss(
-                current_output['picker_q_values'],
-                next_output['picker_q_values'], 
-                actions[state['agv'].num_nodes:],
-                rewards[state['agv'].num_nodes:],
-                dones[state['agv'].num_nodes:]
-            )
-            
-            loss = agv_loss + picker_loss
-            total_loss += loss
-            
-        # Backpropagation
-        self.optimizer.zero_grad()
-        (total_loss / batch_size).backward()
-        self.optimizer.step()
+            # ============ PICKER UPDATES ============
+            if self.num_pickers > 0:
+                # Picker Critic Update
+                current_picker_q = self.ac_network.picker_critic(current_output['picker_embeddings'], picker_actions)
+                
+                with torch.no_grad():
+                    next_picker_q = self.ac_network.picker_critic(next_output['picker_embeddings'], picker_actions)
+                    picker_targets = picker_rewards + self.gamma * next_picker_q * (1 - picker_dones)
+                
+                picker_critic_loss = F.mse_loss(current_picker_q, picker_targets)
+                
+                self.picker_critic_optimizer.zero_grad()
+                picker_critic_loss.backward(retain_graph=True)
+                self.picker_critic_optimizer.step()
+                
+                total_picker_critic_loss += picker_critic_loss.item()
+                
+                # Picker Actor Update
+                picker_actor_loss = 0
+                for picker_idx in range(self.num_pickers):
+                    advantage = self.ac_network.compute_counterfactual_advantage(
+                        current_output, 'picker', picker_idx, picker_actions, 'picker_critic'
+                    )
+                    
+                    # Get log probability of taken action
+                    picker_embedding = current_output['picker_embeddings'][picker_idx:picker_idx+1]
+                    action_probs = self.ac_network.picker_actor.get_action_probs(picker_embedding)
+                    taken_action = picker_actions[picker_idx]
+                    log_prob = torch.log(action_probs[0, taken_action] + 1e-8)
+                    
+                    picker_actor_loss += -log_prob * advantage.detach()
+                
+                picker_actor_loss = picker_actor_loss / self.num_pickers
+                
+                self.picker_actor_optimizer.zero_grad()
+                picker_actor_loss.backward()
+                self.picker_actor_optimizer.step()
+                
+                total_picker_actor_loss += picker_actor_loss.item()
         
-        # Decay epsilon
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-            
-    def _compute_agent_loss(self, current_q, next_q, actions, rewards, dones):
-        """Compute DQN loss for a group of agents"""                         
-        current_q_values = current_q.gather(1, torch.tensor(actions).unsqueeze(1))
-        next_q_values = next_q.max(1)[0].detach()
-
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
-        dones_tensor = torch.tensor(dones, dtype=torch.float32)
-        target_q_values = rewards_tensor + (self.gamma * next_q_values * (1 - dones_tensor))
-        
-        return nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+        return {
+            'agv_actor_loss': total_agv_actor_loss / batch_size,
+            'picker_actor_loss': total_picker_actor_loss / batch_size,
+            'agv_critic_loss': total_agv_critic_loss / batch_size,
+            'picker_critic_loss': total_picker_critic_loss / batch_size
+        }
 
 class MultiAgentGraphConverter:
     def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
@@ -318,12 +555,6 @@ class MultiAgentGraphConverter:
 
         # self.obs_lengths = [self.obs_length for _ in range(self.num_agents)]
         self.position_to_sections = {}
-
-    def process_coordinates(self, coords):
-        if self.normalised_coordinates:
-            return (coords[0] / (self.grid_size[0] - 1), coords[1] / (self.grid_size[1] - 1))
-        else:
-            return coords
 
     def _build_graph_from_observation(self, observation, rack_locations):
         self.num_location_nodes = len(rack_locations)
@@ -586,25 +817,41 @@ node_dims = {
     'picker': 4,  # Picker feature dimension
     'location': 2  # Location feature dimension
 }
+
 env = gym.make("tarware-large-19agvs-9pickers-partialobs-v1")
-print(env.unwrapped.action_size)
-agent = GraphMARL_DQN(
-    node_dims=node_dims,
+print(f"Action size: {env.unwrapped.action_size}")
+
+num_agvs = 19
+num_picker = 9
+
+# Create Graph ODE network
+graph_ode_net = HeteroGraphODENetwork(node_dims, env.unwrapped.action_size)
+
+# Create Modified COMA agent (with experience replay)
+agent = TypeLevelCOMA(
+    graph_ode_network=graph_ode_net,
+    num_agvs=num_agvs,
+    num_pickers=num_picker,
     action_size=env.unwrapped.action_size,
-    lr=1e-3,
-    gamma=0.99
+    lr_actor=1e-3,
+    lr_critic=1e-3,
+    gamma=0.99,
+    memory_size=50000  # Larger buffer for better sample efficiency
 )
+
 batch_size = 64
 seed = args.seed
 completed_episodes = 0
 scores = deque(maxlen=100)
-num_agvs = 19
-num_picker = 9
-grid_size = (35, 22)
+
 graph_converter = MultiAgentGraphConverter(
-    num_agvs = num_agvs,
-    num_pickers = num_picker,
+    num_agvs=num_agvs,
+    num_pickers=num_picker,
 )
+
+print("Starting Modified COMA Training...")
+print("=" * 60)
+
 for episode in range(args.num_episodes):
     state = env.reset()
     rack_locations = env.unwrapped.observation_space_mapper.get_rack_locations()
@@ -615,20 +862,23 @@ for episode in range(args.num_episodes):
     done = False
     step = 0
     all_infos = []
+    episode_experiences = []
+    
+    # Episode execution
     while not done and step < 1000:  # Max steps per episode
         # Get valid action masks
         valid_action_masks = env.unwrapped.compute_valid_action_masks()
         
-        # Choose actions
-        actions = agent.act(hetero_data, valid_action_masks)
-        
+        # Choose actions using COMA policy
+        actions, log_probs, graph_output = agent.act(hetero_data, valid_action_masks, training=True)
+
         # Take environment step
         next_state, rewards, dones, truncated, info = env.step(actions)
         next_rack_locations = env.unwrapped.observation_space_mapper.get_rack_locations()
         next_hetero_data = graph_converter._build_graph_from_observation(next_state, next_rack_locations)
         
-        # Store experience
-        agent.remember(hetero_data, actions, rewards, next_hetero_data, dones)
+        # Store experience for this episode
+        episode_experiences.append((hetero_data, actions, rewards, next_hetero_data, dones))
         
         # Update state
         hetero_data = next_hetero_data
@@ -637,24 +887,62 @@ for episode in range(args.num_episodes):
         done = all(dones)
         step += 1
         all_infos.append(info)
-        # Train the model
-        if len(agent.memory) > batch_size:
-            agent.replay(batch_size)
-            
-    # Update target network periodically
-    if episode % 100 == 0:
-        agent.update_target_network()
+    
+    # ============ MODIFIED COMA TRAINING ============
+    # Add episode experiences to replay buffer
+    for experience in episode_experiences:
+        agent.remember(*experience)
+    
+    # Train at the end of episode using experience replay
+    losses = {}
+    if len(agent.memory) >= batch_size:
+        # Train multiple times per episode for better learning
+        num_updates = max(1, len(episode_experiences) // 10)  # Adaptive updates
         
+        total_losses = {
+            'agv_actor_loss': 0,
+            'picker_actor_loss': 0, 
+            'agv_critic_loss': 0,
+            'picker_critic_loss': 0
+        }
+        
+        for _ in range(num_updates):
+            batch_losses = agent.replay(batch_size)
+            for key in total_losses:
+                total_losses[key] += batch_losses.get(key, 0)
+        
+        # Average the losses
+        losses = {key: val / num_updates for key, val in total_losses.items()}
+    
     scores.append(total_reward)
     
-    # Logging
+    # ============ LOGGING ============
     if episode % 10 == 0:
         avg_score = np.mean(scores)
-        print(f"Episode {episode}, Average Score: {avg_score:.2f}, Epsilon: {agent.epsilon:.3f}")
+        memory_size = len(agent.memory)
+        print(f"Episode {episode:4d} | Avg Score: {avg_score:8.2f} | Memory: {memory_size:5d}")
+        
+        if losses:
+            print(f"             | AGV Actor: {losses['agv_actor_loss']:7.4f} | AGV Critic: {losses['agv_critic_loss']:7.4f}")
+            print(f"             | Picker Actor: {losses['picker_actor_loss']:4.4f} | Picker Critic: {losses['picker_critic_loss']:4.4f}")
+        print("-" * 60)
+    
+    # Detailed episode statistics
     last_info = info_statistics(all_infos, total_reward, episode_returns)
     last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
-    episode_length = len(info)
-    print(f"Completed Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}]")
+    
+    print(f"Episode {completed_episodes:3d}: Pick Rate={last_info.get('overall_pick_rate'):5.1f} | "
+          f"Global Return={last_info.get('global_episode_return'):6.1f} | "
+          f"Deliveries={last_info.get('total_deliveries'):3.0f} | "
+          f"Clashes={last_info.get('total_clashes'):3.0f} | "
+          f"Stuck={last_info.get('total_stuck'):3.0f}")
+    
     completed_episodes += 1
+    
+    # Optional: Clear old experiences periodically to prevent overfitting
+    if episode % 200 == 0 and episode > 0:
+        print(f"Clearing replay buffer at episode {episode}")
+        agent.memory.clear()
 
+print("Training completed!")
 env.close()
