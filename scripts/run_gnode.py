@@ -10,7 +10,8 @@ from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import HeteroConv, SAGEConv
 
 from torchdiffeq import odeint
-
+import wandb
+import datetime
 import numpy as np
 from collections import deque
 import random
@@ -524,6 +525,195 @@ class TypeLevelCOMA:
             'picker_critic_loss': total_picker_critic_loss / batch_size
         }
 
+class SimpleIndependentDQN:
+    """Simple Independent Q-Learning using Graph ODE for feature extraction"""
+    
+    def __init__(self, graph_ode_network, num_agvs, num_pickers, action_size, 
+                 lr=1e-3, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, 
+                 epsilon_min=0.01, memory_size=10000):
+        
+        self.graph_network = graph_ode_network
+        self.num_agvs = num_agvs
+        self.num_pickers = num_pickers
+        self.num_agents = num_agvs + num_pickers
+        self.action_size = action_size
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        
+        # Target network (same as main network)
+        self.target_network = HeteroGraphODENetwork(
+            {'agv': graph_ode_network.agv_dim, 
+             'picker': graph_ode_network.picker_dim, 
+             'location': graph_ode_network.location_dim}, 
+            action_size, 
+            graph_ode_network.hidden_dim
+        )
+        
+        # Optimizer
+        self.optimizer = optim.Adam(self.graph_network.parameters(), lr=lr)
+        
+        # Experience replay
+        self.memory = deque(maxlen=memory_size)
+        
+        # Update target network
+        self.update_target_network()
+        
+    def update_target_network(self):
+        """Copy weights from main network to target network"""
+        self.target_network.load_state_dict(self.graph_network.state_dict())
+        
+    def remember(self, hetero_data, actions, rewards, next_hetero_data, dones):
+        """Store experience in replay buffer"""
+        self.memory.append((hetero_data, actions, rewards, next_hetero_data, dones))
+        
+    def act(self, hetero_data, valid_action_masks, training=True):
+        """Choose actions using epsilon-greedy policy"""
+        if training and np.random.random() <= self.epsilon:
+            # Random action (exploration)
+            actions = []
+            for agent_idx in range(self.num_agents):
+                valid_actions = np.where(valid_action_masks[agent_idx] == 1)[0]
+                actions.append(np.random.choice(valid_actions))
+            return actions
+        
+        # Greedy action (exploitation)
+        with torch.no_grad():
+            output = self.graph_network(hetero_data)
+            
+            actions = []
+            # AGV actions
+            for i in range(self.num_agvs):
+                if i < output['agv_q_values'].size(0):
+                    q_vals = output['agv_q_values'][i]
+                    masked_q_vals = q_vals.clone()
+                    masked_q_vals[valid_action_masks[i] == 0] = float('-inf')
+                    actions.append(masked_q_vals.argmax().item())
+                else:
+                    # Fallback for missing agents
+                    valid_actions = np.where(valid_action_masks[i] == 1)[0]
+                    actions.append(np.random.choice(valid_actions))
+                    
+            # Picker actions
+            for i in range(self.num_pickers):
+                agent_idx = self.num_agvs + i
+                if i < output['picker_q_values'].size(0):
+                    q_vals = output['picker_q_values'][i]
+                    masked_q_vals = q_vals.clone()
+                    masked_q_vals[valid_action_masks[agent_idx] == 0] = float('-inf')
+                    actions.append(masked_q_vals.argmax().item())
+                else:
+                    # Fallback for missing agents
+                    valid_actions = np.where(valid_action_masks[agent_idx] == 1)[0]
+                    actions.append(np.random.choice(valid_actions))
+                
+        return actions
+        
+    def replay(self, batch_size=32):
+        """Train the network on a batch of experiences"""
+        if len(self.memory) < batch_size:
+            return {}
+            
+        batch = random.sample(self.memory, batch_size)
+        
+        total_loss = 0
+        num_valid_samples = 0
+        
+        for hetero_data, actions, rewards, next_hetero_data, dones in batch:
+            try:
+                # Convert to tensors
+                actions_tensor = torch.tensor(actions, dtype=torch.long)
+                rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+                dones_tensor = torch.tensor(dones, dtype=torch.float32)
+                
+                # Current Q values
+                current_output = self.graph_network(hetero_data)
+                
+                # Target Q values
+                with torch.no_grad():
+                    next_output = self.target_network(next_hetero_data)
+                
+                # Compute loss for AGVs
+                if self.num_agvs > 0 and current_output['agv_q_values'].size(0) > 0:
+                    agv_actions = actions_tensor[:self.num_agvs]
+                    agv_rewards = rewards_tensor[:self.num_agvs]
+                    agv_dones = dones_tensor[:self.num_agvs]
+                    
+                    # Ensure we don't exceed available agents
+                    actual_agvs = min(self.num_agvs, current_output['agv_q_values'].size(0))
+                    agv_actions = agv_actions[:actual_agvs]
+                    agv_rewards = agv_rewards[:actual_agvs]
+                    agv_dones = agv_dones[:actual_agvs]
+                    
+                    agv_loss = self._compute_agent_loss(
+                        current_output['agv_q_values'][:actual_agvs], 
+                        next_output['agv_q_values'][:actual_agvs],
+                        agv_actions, agv_rewards, agv_dones
+                    )
+                    total_loss += agv_loss
+                
+                # Compute loss for Pickers
+                if self.num_pickers > 0 and current_output['picker_q_values'].size(0) > 0:
+                    picker_actions = actions_tensor[self.num_agvs:]
+                    picker_rewards = rewards_tensor[self.num_agvs:]
+                    picker_dones = dones_tensor[self.num_agvs:]
+                    
+                    # Ensure we don't exceed available agents
+                    actual_pickers = min(self.num_pickers, current_output['picker_q_values'].size(0))
+                    picker_actions = picker_actions[:actual_pickers]
+                    picker_rewards = picker_rewards[:actual_pickers]
+                    picker_dones = picker_dones[:actual_pickers]
+                    
+                    picker_loss = self._compute_agent_loss(
+                        current_output['picker_q_values'][:actual_pickers],
+                        next_output['picker_q_values'][:actual_pickers], 
+                        picker_actions, picker_rewards, picker_dones
+                    )
+                    total_loss += picker_loss
+                
+                num_valid_samples += 1
+                
+            except Exception as e:
+                print(f"Error in replay: {e}")
+                continue
+        
+        if num_valid_samples > 0:
+            # Backpropagation
+            avg_loss = total_loss / num_valid_samples
+            self.optimizer.zero_grad()
+            avg_loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.graph_network.parameters(), max_norm=1.0)
+            
+            self.optimizer.step()
+            
+            # Decay epsilon
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
+                
+            return {'total_loss': avg_loss.item(), 'epsilon': self.epsilon}
+        
+        return {}
+            
+    def _compute_agent_loss(self, current_q, next_q, actions, rewards, dones):
+        """Compute DQN loss for a group of agents"""
+        if len(actions) == 0:
+            return torch.tensor(0.0, requires_grad=True)
+            
+        try:
+            current_q_values = current_q.gather(1, actions.unsqueeze(1))
+            next_q_values = next_q.max(1)[0].detach()
+            target_q_values = rewards + (self.gamma * next_q_values * (1 - dones))
+            
+            loss = F.mse_loss(current_q_values.squeeze(), target_q_values)
+            return loss
+            
+        except Exception as e:
+            print(f"Error in agent loss computation: {e}")
+            return torch.tensor(0.0, requires_grad=True)
+
 class MultiAgentGraphConverter:
     def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
 
@@ -811,6 +1001,15 @@ class MultiAgentGraphConverter:
         group_j = self.position_to_sections[(pos_j[0], pos_j[1])]
         return (group_i is not None and group_j is not None and group_i == group_j)
 
+learning_config ={'env': 'tarware-large-19agvs-9pickers-partialobs-v1', 'ode': 'euler', 'lr': 1e-4, 'gamma': 0.999, 'epsilon_decay': 0.999, 'epsilon_min' : 0.1, 'memory_size': 100000, 'batch_size': 128, 'hidden_dim': 128}
+wandb.init(
+        project="swarm_ode",
+        name="ode+iql",
+        config=learning_config
+    )
+current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+model_path = f'./trained_models/{current_time}'
+os.makedirs(model_path, exist_ok=True)
 # Initialize model
 node_dims = {
     'agv': 7,  # AGV feature dimension
@@ -825,21 +1024,33 @@ num_agvs = 19
 num_picker = 9
 
 # Create Graph ODE network
-graph_ode_net = HeteroGraphODENetwork(node_dims, env.unwrapped.action_size)
+graph_ode_net = HeteroGraphODENetwork(node_dims, env.unwrapped.action_size, hidden_dim=learning_config['hidden_dim'])
 
-# Create Modified COMA agent (with experience replay)
-agent = TypeLevelCOMA(
+# # Create Modified COMA agent (with experience replay)
+# agent = TypeLevelCOMA(
+#     graph_ode_network=graph_ode_net,
+#     num_agvs=num_agvs,
+#     num_pickers=num_picker,
+#     action_size=env.unwrapped.action_size,
+#     lr_actor=1e-3,
+#     lr_critic=1e-3,
+#     gamma=0.99,
+#     memory_size=50000  # Larger buffer for better sample efficiency
+# )
+# Create Independent DQN agent
+agent = SimpleIndependentDQN(
     graph_ode_network=graph_ode_net,
     num_agvs=num_agvs,
     num_pickers=num_picker,
     action_size=env.unwrapped.action_size,
-    lr_actor=1e-3,
-    lr_critic=1e-3,
-    gamma=0.99,
-    memory_size=50000  # Larger buffer for better sample efficiency
+    lr=learning_config['lr'],
+    gamma=learning_config['gamma'],
+    epsilon=learning_config['epsilon'],
+    epsilon_decay=learning_config['epsilon_decay'],
+    epsilon_min=learning_config['epsilon_min'],
+    memory_size=learning_config['memory_size']
 )
-
-batch_size = 64
+batch_size = learning_config['batch_size']
 seed = args.seed
 completed_episodes = 0
 scores = deque(maxlen=100)
@@ -848,9 +1059,6 @@ graph_converter = MultiAgentGraphConverter(
     num_agvs=num_agvs,
     num_pickers=num_picker,
 )
-
-print("Starting Modified COMA Training...")
-print("=" * 60)
 
 for episode in range(args.num_episodes):
     state = env.reset()
@@ -862,24 +1070,29 @@ for episode in range(args.num_episodes):
     done = False
     step = 0
     all_infos = []
-    episode_experiences = []
+    episode_losses = []
+    # episode_experiences = []
     
     # Episode execution
     while not done and step < 1000:  # Max steps per episode
         # Get valid action masks
         valid_action_masks = env.unwrapped.compute_valid_action_masks()
         
-        # Choose actions using COMA policy
-        actions, log_probs, graph_output = agent.act(hetero_data, valid_action_masks, training=True)
+        # # Choose actions using COMA policy
+        # actions, log_probs, graph_output = agent.act(hetero_data, valid_action_masks, training=True)
+        
+        # Choose actions using epsilon-greedy policy
+        actions = agent.act(hetero_data, valid_action_masks, training=True)
 
         # Take environment step
         next_state, rewards, dones, truncated, info = env.step(actions)
         next_rack_locations = env.unwrapped.observation_space_mapper.get_rack_locations()
         next_hetero_data = graph_converter._build_graph_from_observation(next_state, next_rack_locations)
         
-        # Store experience for this episode
-        episode_experiences.append((hetero_data, actions, rewards, next_hetero_data, dones))
-        
+        # # COMA : Store experience for this episode
+        # episode_experiences.append((hetero_data, actions, rewards, next_hetero_data, dones))
+        agent.remember(hetero_data, actions, rewards, next_hetero_data, dones)
+
         # Update state
         hetero_data = next_hetero_data
         episode_returns += np.array(rewards, dtype=np.float64)
@@ -887,32 +1100,41 @@ for episode in range(args.num_episodes):
         done = all(dones)
         step += 1
         all_infos.append(info)
+
+        if len(agent.memory) > batch_size:
+            loss_info = agent.replay(batch_size)
+            if loss_info:
+                episode_losses.append(loss_info.get('total_loss', 0))
+
+    if episode % 20 == 0:
+        agent.update_target_network()  # Update target network every 20 episodes
+        print(f"Target network updated at episode {episode}")
+
+    # # ============ MODIFIED COMA TRAINING ============
+    # # Add episode experiences to replay buffer
+    # for experience in episode_experiences:
+    #     agent.remember(*experience)
     
-    # ============ MODIFIED COMA TRAINING ============
-    # Add episode experiences to replay buffer
-    for experience in episode_experiences:
-        agent.remember(*experience)
-    
-    # Train at the end of episode using experience replay
-    losses = {}
-    if len(agent.memory) >= batch_size:
-        # Train multiple times per episode for better learning
-        num_updates = max(1, len(episode_experiences) // 10)  # Adaptive updates
+    # # Train at the end of episode using experience replay
+    # losses = {}
+    # if len(agent.memory) >= batch_size:
+    #     # Train multiple times per episode for better learning
+    #     num_updates = max(1, len(episode_experiences) // 10)  # Adaptive updates
         
-        total_losses = {
-            'agv_actor_loss': 0,
-            'picker_actor_loss': 0, 
-            'agv_critic_loss': 0,
-            'picker_critic_loss': 0
-        }
+    #     total_losses = {
+    #         'agv_actor_loss': 0,
+    #         'picker_actor_loss': 0, 
+    #         'agv_critic_loss': 0,
+    #         'picker_critic_loss': 0
+    #     }
         
-        for _ in range(num_updates):
-            batch_losses = agent.replay(batch_size)
-            for key in total_losses:
-                total_losses[key] += batch_losses.get(key, 0)
+    #     for _ in range(num_updates):
+    #         batch_losses = agent.replay(batch_size)
+    #         for key in total_losses:
+    #             total_losses[key] += batch_losses.get(key, 0)
         
-        # Average the losses
-        losses = {key: val / num_updates for key, val in total_losses.items()}
+    #     # Average the losses
+    #     losses = {key: val / num_updates for key, val in total_losses.items()}
     
     scores.append(total_reward)
     
@@ -920,29 +1142,42 @@ for episode in range(args.num_episodes):
     if episode % 10 == 0:
         avg_score = np.mean(scores)
         memory_size = len(agent.memory)
-        print(f"Episode {episode:4d} | Avg Score: {avg_score:8.2f} | Memory: {memory_size:5d}")
-        
-        if losses:
-            print(f"             | AGV Actor: {losses['agv_actor_loss']:7.4f} | AGV Critic: {losses['agv_critic_loss']:7.4f}")
-            print(f"             | Picker Actor: {losses['picker_actor_loss']:4.4f} | Picker Critic: {losses['picker_critic_loss']:4.4f}")
-        print("-" * 60)
-    
+        print(f"Episode {episode:4d} | Avg Score: {avg_score:8.2f} | Memory: {memory_size:5d} | Epsilon: {agent.epsilon:.4f}")
+
+        # COMA LOSS
+        # if losses:
+        #     print(f"             | AGV Actor: {losses['agv_actor_loss']:7.4f} | AGV Critic: {losses['agv_critic_loss']:7.4f}")
+        #     print(f"             | Picker Actor: {losses['picker_actor_loss']:4.4f} | Picker Critic: {losses['picker_critic_loss']:4.4f}")
+        # print("-" * 60)
+
+        if episode % 10 == 0 and episode_losses:
+            avg_loss = np.mean(episode_losses)
+            print(f"Episode {episode:4d} | Avg Loss: {avg_loss:.4f}")
+
     # Detailed episode statistics
     last_info = info_statistics(all_infos, total_reward, episode_returns)
     last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
     
-    print(f"Episode {completed_episodes:3d}: Pick Rate={last_info.get('overall_pick_rate'):5.1f} | "
-          f"Global Return={last_info.get('global_episode_return'):6.1f} | "
-          f"Deliveries={last_info.get('total_deliveries'):3.0f} | "
-          f"Clashes={last_info.get('total_clashes'):3.0f} | "
-          f"Stuck={last_info.get('total_stuck'):3.0f}")
-    
+    print(f"Completed Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate', 0):.2f}]| [Global return={last_info.get('global_episode_return', 0):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries', 0):.2f}]| [Total clashes={last_info.get('total_clashes', 0):.2f}]| [Total stuck={last_info.get('total_stuck', 0):.2f}]")
     completed_episodes += 1
+    wandb.log({'episode': episode, 'avg_loss': avg_loss, 'overall_pick_rate': last_info.get('overall_pick_rate'), 'global_return': last_info.get('global_episode_return'), 'total_deliveries': last_info.get('total_deliveries'), 'clashes': last_info.get('total_clashes'), 'stuck': last_info.get('total_stuck')})
     
     # Optional: Clear old experiences periodically to prevent overfitting
     if episode % 200 == 0 and episode > 0:
         print(f"Clearing replay buffer at episode {episode}")
         agent.memory.clear()
 
+    if episode % 100 == 0 and episode > 0:
+        torch.save({
+            'episode': episode,
+            'model_state_dict': agent.graph_network.state_dict(),
+            'target_state_dict': agent.target_network.state_dict(),
+            'optimizer_state_dict': agent.optimizer.state_dict(),
+            'epsilon': agent.epsilon,
+            'scores': list(scores)
+        }, f'{model_path}/checkpoint_episode_{episode}.pth')
+        
 print("Training completed!")
+print(f"Final average score: {np.mean(scores):.2f}")
+print(f"Final Epsilon: {agent.epsilon:.4f}")
 env.close()
