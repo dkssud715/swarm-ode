@@ -11,7 +11,7 @@ from torch_geometric.data import Batch
 
 from torchdiffeq import odeint
 import wandb
-import datetime
+from datetime import datetime
 import numpy as np
 from collections import deque
 import random
@@ -1032,7 +1032,7 @@ def extract_global_state(env, hetero_data):
     return torch.tensor(global_info, dtype=torch.float32)
 
 
-learning_config ={'env': 'tarware-large-19agvs-9pickers-partialobs-v1', 'ode': 'euler', 'lr': 1e-4, 'gamma': 0.999, 'epsilon_decay': 0.999, 'epsilon_min' : 0.1, 'memory_size': 100000, 'batch_size': 128, 'hidden_dim': 128}
+learning_config ={'env': 'tarware-medium-19agvs-9pickers-partialobs-v1', 'ode': 'euler', 'lr': 1e-4, 'gamma': 0.999, 'epsilon_decay': 0.999, 'epsilon_min' : 0.1, 'memory_size': 100000, 'batch_size': 128, 'hidden_dim': 128}
 wandb.init(
         project="swarm_ode",
         name="gru+iql",
@@ -1048,7 +1048,7 @@ node_dims = {
     'location': 2  # Location feature dimension
 }
 
-env = gym.make("tarware-large-19agvs-9pickers-partialobs-v1")
+env = gym.make("tarware-medium-19agvs-9pickers-partialobs-v1")
 print(f"Action size: {env.unwrapped.action_size}")
 action_dim = env.unwrapped.action_size  # Action dimension
 num_agvs = 19
@@ -1091,7 +1091,7 @@ agent = SimpleIndependentDQN(
     action_size=env.unwrapped.action_size,
     lr=learning_config['lr'],
     gamma=learning_config['gamma'],
-    epsilon=learning_config['epsilon'],
+    epsilon=1.0,
     epsilon_decay=learning_config['epsilon_decay'],
     epsilon_min=learning_config['epsilon_min'],
     memory_size=learning_config['memory_size']

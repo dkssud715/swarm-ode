@@ -11,7 +11,7 @@ from torch_geometric.nn import HeteroConv, SAGEConv
 
 from torchdiffeq import odeint
 import wandb
-import datetime
+from datetime import datetime
 import numpy as np
 from collections import deque
 import random
@@ -130,7 +130,7 @@ class HeteroGraphODENetwork(nn.Module):
         # 이제 더 이상 모든 임베딩을 합치지 않습니다.
         t = torch.tensor([0., integration_time], dtype=torch.float32, device=x_dict['agv'].device)
         
-        evolved_agv_embeddings = odeint(self.ode_func_agv, x_dict['agv'], t, method='eulersksms')[-1] # 'dopri5'
+        evolved_agv_embeddings = odeint(self.ode_func_agv, x_dict['agv'], t, method='euler')[-1] # 'dopri5'
         evolved_picker_embeddings = odeint(self.ode_func_picker, x_dict['picker'], t, method='euler')[-1] # 'dopri5'
         
         # Location 노드는 동적인 상태 변화가 없으므로 ODE를 적용하지 않고 GNN의 결과만 사용합니다.
@@ -1001,7 +1001,7 @@ class MultiAgentGraphConverter:
         group_j = self.position_to_sections[(pos_j[0], pos_j[1])]
         return (group_i is not None and group_j is not None and group_i == group_j)
 
-learning_config ={'env': 'tarware-large-19agvs-9pickers-partialobs-v1', 'ode': 'euler', 'lr': 1e-4, 'gamma': 0.999, 'epsilon_decay': 0.999, 'epsilon_min' : 0.1, 'memory_size': 100000, 'batch_size': 128, 'hidden_dim': 128}
+learning_config ={'env': 'tarware-medium-19agvs-9pickers-partialobs-v1', 'ode': 'euler', 'lr': 1e-4, 'gamma': 0.999, 'epsilon_decay': 0.999, 'epsilon_min' : 0.1, 'memory_size': 100000, 'batch_size': 128, 'hidden_dim': 128}
 wandb.init(
         project="swarm_ode",
         name="ode+iql",
@@ -1017,7 +1017,7 @@ node_dims = {
     'location': 2  # Location feature dimension
 }
 
-env = gym.make("tarware-large-19agvs-9pickers-partialobs-v1")
+env = gym.make("tarware-medium-19agvs-9pickers-partialobs-v1")
 print(f"Action size: {env.unwrapped.action_size}")
 
 num_agvs = 19
@@ -1045,7 +1045,7 @@ agent = SimpleIndependentDQN(
     action_size=env.unwrapped.action_size,
     lr=learning_config['lr'],
     gamma=learning_config['gamma'],
-    epsilon=learning_config['epsilon'],
+    epsilon=1.0,
     epsilon_decay=learning_config['epsilon_decay'],
     epsilon_min=learning_config['epsilon_min'],
     memory_size=learning_config['memory_size']
