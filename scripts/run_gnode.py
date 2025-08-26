@@ -11,6 +11,7 @@ from torch_geometric.nn import HeteroConv, SAGEConv
 
 from torchdiffeq import odeint
 import wandb
+import copy
 from datetime import datetime
 import numpy as np
 from collections import deque
@@ -714,6 +715,329 @@ class SimpleIndependentDQN:
             print(f"Error in agent loss computation: {e}")
             return torch.tensor(0.0, requires_grad=True)
 
+class QMIXAgent:
+    """
+    Simple QMIX Agent with clean interface
+    Usage: actions = agent.act(hetero_data, valid_action_masks, training=True)
+    """
+    
+    def __init__(self, node_dims, action_size, global_state_dim, 
+                 hidden_dim=64, num_layers=2, ode_hidden_dim=32, 
+                 mixing_embed_dim=32, hypernet_embed=64,
+                 lr=1e-3, gamma=0.99, epsilon_start=1.0, epsilon_min=0.01, epsilon_decay=0.995,
+                 buffer_size=100000, batch_size=32, update_target_freq=200,
+                 device='cuda' if torch.cuda.is_available() else 'cpu'):
+        
+        self.device = device
+        self.action_size = action_size
+        self.gamma = gamma
+        self.batch_size = batch_size
+        self.update_target_freq = update_target_freq
+        self.training_step = 0
+        
+        # Networks
+        self.q_network = HeteroQMIXNetwork(
+            node_dims, action_size, global_state_dim, 
+            hidden_dim, num_layers, ode_hidden_dim, 
+            mixing_embed_dim, hypernet_embed
+        ).to(device)
+        
+        self.target_network = copy.deepcopy(self.q_network)
+        
+        # Optimizer
+        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
+        
+        # Exploration
+        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        
+        # Experience replay
+        self.replay_buffer = SimpleReplayBuffer(buffer_size)
+        
+        print(f"QMIXAgent initialized on {device}")
+        print(f"Parameters: {sum(p.numel() for p in self.q_network.parameters()):,}")
+    
+    def act(self, hetero_data, global_state, valid_action_masks=None, training=True):
+        """
+        Simple action selection interface
+        
+        Args:
+            hetero_data: Heterogeneous graph data
+            global_state: Global environment state [state_dim] or [batch, state_dim]
+            valid_action_masks: Optional action masks {'agv': [...], 'picker': [...]}
+            training: If True, uses epsilon-greedy; if False, uses greedy
+        
+        Returns:
+            actions: Dictionary of actions {'agv': [...], 'picker': [...]}
+        """
+        with torch.no_grad():
+            # Ensure tensors are on correct device
+            hetero_data = hetero_data.to(self.device)
+            if isinstance(global_state, torch.Tensor):
+                global_state = global_state.to(self.device)
+            else:
+                global_state = torch.tensor(global_state, dtype=torch.float32, device=self.device)
+            
+            # Add batch dimension if needed
+            if global_state.dim() == 1:
+                global_state = global_state.unsqueeze(0)
+                single_batch = True
+            else:
+                single_batch = False
+            
+            # Get Q-values
+            q_outputs = self.q_network.q_network(hetero_data)
+            agv_q = q_outputs['agv_q_values']  # [batch, n_agv, action_size]
+            picker_q = q_outputs['picker_q_values']  # [batch, n_picker, action_size]
+            
+            actions = {}
+            
+            # AGV actions
+            if training and np.random.random() < self.epsilon:
+                # Random exploration
+                actions['agv'] = torch.randint(0, self.action_size, 
+                                             (agv_q.size(0), agv_q.size(1)), 
+                                             device=self.device)
+            else:
+                # Greedy action selection
+                if valid_action_masks and 'agv' in valid_action_masks:
+                    # Apply action masks
+                    masked_q = agv_q.clone()
+                    mask = valid_action_masks['agv'].to(self.device)
+                    masked_q[~mask] = float('-inf')
+                    actions['agv'] = masked_q.argmax(dim=-1)
+                else:
+                    actions['agv'] = agv_q.argmax(dim=-1)
+            
+            # Picker actions
+            if training and np.random.random() < self.epsilon:
+                actions['picker'] = torch.randint(0, self.action_size,
+                                                (picker_q.size(0), picker_q.size(1)),
+                                                device=self.device)
+            else:
+                if valid_action_masks and 'picker' in valid_action_masks:
+                    masked_q = picker_q.clone()
+                    mask = valid_action_masks['picker'].to(self.device)
+                    masked_q[~mask] = float('-inf')
+                    actions['picker'] = masked_q.argmax(dim=-1)
+                else:
+                    actions['picker'] = picker_q.argmax(dim=-1)
+            
+            # Remove batch dimension if input was single
+            if single_batch:
+                actions = {k: v.squeeze(0) for k, v in actions.items()}
+            
+            return actions
+    
+    def remember(self, hetero_data, global_state, actions, reward, next_hetero_data, next_global_state, done):
+        """Store experience in replay buffer"""
+        self.replay_buffer.push(hetero_data, global_state, actions, reward, 
+                               next_hetero_data, next_global_state, done)
+    
+    def learn(self):
+        """
+        Learn from experiences in replay buffer
+        Returns True if learning occurred, False if buffer not ready
+        """
+        if len(self.replay_buffer) < self.batch_size:
+            return False
+        
+        # Sample batch
+        batch = self.replay_buffer.sample(self.batch_size)
+        hetero_data, global_states, actions, rewards, next_hetero_data, next_global_states, dones = batch
+        
+        # Move to device
+        global_states = global_states.to(self.device)
+        rewards = rewards.to(self.device)
+        next_global_states = next_global_states.to(self.device)
+        dones = dones.to(self.device)
+        actions = {k: v.to(self.device) for k, v in actions.items()}
+        
+        # Current Q-values
+        q_outputs, current_global_q = self.q_network(hetero_data, global_states, mode='training')
+        
+        # Get Q-values for taken actions
+        agv_q_taken = q_outputs['agv_q_values'].gather(-1, actions['agv'].unsqueeze(-1)).squeeze(-1)
+        picker_q_taken = q_outputs['picker_q_values'].gather(-1, actions['picker'].unsqueeze(-1)).squeeze(-1)
+        
+        # Mix the taken Q-values
+        all_q_taken = torch.cat([agv_q_taken, picker_q_taken], dim=-1)
+        current_mixed_q = self.q_network.mix_q_values_for_actions(all_q_taken, global_states)
+        
+        # Target Q-values
+        with torch.no_grad():
+            # Get next actions using main network (Double DQN)
+            next_q_outputs = self.q_network.q_network(next_hetero_data)
+            next_actions = {
+                'agv': next_q_outputs['agv_q_values'].argmax(dim=-1),
+                'picker': next_q_outputs['picker_q_values'].argmax(dim=-1)
+            }
+            
+            # Evaluate using target network
+            target_q_outputs = self.target_network.q_network(next_hetero_data)
+            next_agv_q = target_q_outputs['agv_q_values'].gather(-1, next_actions['agv'].unsqueeze(-1)).squeeze(-1)
+            next_picker_q = target_q_outputs['picker_q_values'].gather(-1, next_actions['picker'].unsqueeze(-1)).squeeze(-1)
+            
+            next_all_q = torch.cat([next_agv_q, next_picker_q], dim=-1)
+            next_mixed_q = self.target_network.mix_q_values_for_actions(next_all_q, next_global_states)
+            
+            target_q = rewards + self.gamma * next_mixed_q * (1 - dones.float())
+        
+        # Loss
+        loss = F.mse_loss(current_mixed_q, target_q)
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=10.0)
+        self.optimizer.step()
+        
+        # Update exploration
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        
+        # Update target network
+        self.training_step += 1
+        if self.training_step % self.update_target_freq == 0:
+            self.target_network.load_state_dict(self.q_network.state_dict())
+        
+        return True
+    
+    def save(self, filepath):
+        """Save agent"""
+        torch.save({
+            'q_network': self.q_network.state_dict(),
+            'target_network': self.target_network.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'training_step': self.training_step
+        }, filepath)
+    
+    def load(self, filepath):
+        """Load agent"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.q_network.load_state_dict(checkpoint['q_network'])
+        self.target_network.load_state_dict(checkpoint['target_network'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.epsilon = checkpoint['epsilon']
+        self.training_step = checkpoint['training_step']
+    
+    def get_stats(self):
+        """Get training statistics"""
+        return {
+            'epsilon': self.epsilon,
+            'training_step': self.training_step,
+            'buffer_size': len(self.replay_buffer),
+            'exploration_rate': f"{self.epsilon:.1%}"
+        }
+
+class HeteroQMIXNetwork(nn.Module):
+    """Simplified Heterogeneous QMIX Network"""
+    
+    def __init__(self, node_dims, action_size, global_state_dim, 
+                 hidden_dim=64, num_layers=2, ode_hidden_dim=32, 
+                 mixing_embed_dim=32, hypernet_embed=64):
+        super().__init__()
+        
+        self.action_size = action_size
+        self.hidden_dim = hidden_dim
+        self.mixing_embed_dim = mixing_embed_dim
+        
+        # Individual Q-Network
+        self.q_network = HeteroGraphODENetwork(
+            node_dims, action_size, hidden_dim, num_layers, ode_hidden_dim
+        )
+        
+        # Mixing Network
+        self.state_encoder = nn.Sequential(
+            nn.Linear(global_state_dim, hypernet_embed),
+            nn.ReLU(),
+            nn.Linear(hypernet_embed, hypernet_embed)
+        )
+        
+        self.hyper_w1 = nn.Sequential(
+            nn.Linear(hypernet_embed, mixing_embed_dim * 10),  # Assume max 10 agents
+            nn.ReLU()
+        )
+        
+        self.hyper_w2 = nn.Sequential(
+            nn.Linear(hypernet_embed, mixing_embed_dim),
+            nn.ReLU(),
+            nn.Linear(mixing_embed_dim, 1)
+        )
+        
+        self.hyper_b1 = nn.Linear(hypernet_embed, mixing_embed_dim)
+        self.hyper_b2 = nn.Sequential(
+            nn.Linear(hypernet_embed, mixing_embed_dim),
+            nn.ReLU(),
+            nn.Linear(mixing_embed_dim, 1)
+        )
+    
+    def forward(self, hetero_data, global_state, mode='q_values'):
+        """Forward pass"""
+        q_outputs = self.q_network(hetero_data)
+        
+        if mode == 'training':
+            global_q = self.mix_q_values(q_outputs, global_state)
+            return q_outputs, global_q
+        else:
+            return q_outputs
+    
+    def mix_q_values_for_actions(self, all_q_values, global_state):
+        """Mix Q-values for specific actions"""
+        batch_size, n_agents = all_q_values.shape
+        
+        # Encode state
+        state_embed = self.state_encoder(global_state)
+        
+        # Mixing weights (ensure monotonicity)
+        w1 = torch.abs(self.hyper_w1(state_embed))[:, :n_agents * self.mixing_embed_dim]
+        w1 = w1.view(batch_size, self.mixing_embed_dim, n_agents)
+        
+        b1 = self.hyper_b1(state_embed).unsqueeze(-1)
+        
+        # First layer
+        hidden = torch.bmm(w1, all_q_values.unsqueeze(-1)) + b1
+        hidden = F.elu(hidden)
+        
+        # Second layer
+        w2 = torch.abs(self.hyper_w2(state_embed)).view(batch_size, 1, self.mixing_embed_dim)
+        b2 = self.hyper_b2(state_embed)
+        
+        global_q = torch.bmm(w2, hidden).squeeze(-1) + b2
+        
+        return global_q.squeeze(-1)
+
+class SimpleReplayBuffer:
+    """Simplified replay buffer"""
+    
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, *args):
+        self.buffer.append(args)
+
+    def sample(self, batch_size):
+        import random
+        batch = random.sample(list(self.buffer), batch_size)
+        
+        # Unpack and batch
+        hetero_data = [item[0] for item in batch]
+        global_states = torch.stack([item[1] for item in batch])
+        actions = {
+            'agv': torch.stack([item[2]['agv'] for item in batch]),
+            'picker': torch.stack([item[2]['picker'] for item in batch])
+        }
+        rewards = torch.stack([item[3] for item in batch])
+        next_hetero_data = [item[4] for item in batch]
+        next_global_states = torch.stack([item[5] for item in batch])
+        dones = torch.stack([item[6] for item in batch])
+        
+        return hetero_data, global_states, actions, rewards, next_hetero_data, next_global_states, dones
+    
+    def __len__(self):
+        return len(self.buffer) 
+
 class MultiAgentGraphConverter:
     def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
 
@@ -1004,7 +1328,7 @@ class MultiAgentGraphConverter:
 learning_config ={'env': 'tarware-medium-19agvs-9pickers-partialobs-v1', 'ode': 'euler', 'lr': 1e-4, 'gamma': 0.999, 'epsilon_decay': 0.999, 'epsilon_min' : 0.1, 'memory_size': 100000, 'batch_size': 128, 'hidden_dim': 128}
 wandb.init(
         project="swarm_ode",
-        name="ode+iql",
+        name="ode+qmix",
         config=learning_config
     )
 current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1024,7 +1348,7 @@ num_agvs = 19
 num_picker = 9
 
 # Create Graph ODE network
-graph_ode_net = HeteroGraphODENetwork(node_dims, env.unwrapped.action_size, hidden_dim=learning_config['hidden_dim'])
+# graph_ode_net = HeteroGraphODENetwork(node_dims, env.unwrapped.action_size, hidden_dim=learning_config['hidden_dim'])
 
 # # Create Modified COMA agent (with experience replay)
 # agent = TypeLevelCOMA(
@@ -1037,19 +1361,35 @@ graph_ode_net = HeteroGraphODENetwork(node_dims, env.unwrapped.action_size, hidd
 #     gamma=0.99,
 #     memory_size=50000  # Larger buffer for better sample efficiency
 # )
-# Create Independent DQN agent
-agent = SimpleIndependentDQN(
-    graph_ode_network=graph_ode_net,
-    num_agvs=num_agvs,
-    num_pickers=num_picker,
+# # Create Independent DQN agent
+# agent = SimpleIndependentDQN(
+#     graph_ode_network=graph_ode_net,
+#     num_agvs=num_agvs,
+#     num_pickers=num_picker,
+#     action_size=env.unwrapped.action_size,
+#     lr=learning_config['lr'],
+#     gamma=learning_config['gamma'],
+#     epsilon=1.0,
+#     epsilon_decay=learning_config['epsilon_decay'],
+#     epsilon_min=learning_config['epsilon_min'],
+#     memory_size=learning_config['memory_size']
+# )
+agent = QMIXAgent(
+    node_dims=node_dims,
     action_size=env.unwrapped.action_size,
+    global_state_dim=env.unwrapped.observation_space.shape[0],  # Global state dimension
+    hidden_dim=learning_config['hidden_dim'],
     lr=learning_config['lr'],
     gamma=learning_config['gamma'],
-    epsilon=1.0,
-    epsilon_decay=learning_config['epsilon_decay'],
+    epsilon_start=1.0,
     epsilon_min=learning_config['epsilon_min'],
-    memory_size=learning_config['memory_size']
-)
+    epsilon_decay=learning_config['epsilon_decay'],
+    buffer_size=learning_config['memory_size'],
+    batch_size=learning_config['batch_size'],
+    update_target_freq=20, 
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+
 batch_size = learning_config['batch_size']
 seed = args.seed
 completed_episodes = 0
@@ -1082,7 +1422,8 @@ for episode in range(args.num_episodes):
         # actions, log_probs, graph_output = agent.act(hetero_data, valid_action_masks, training=True)
         
         # Choose actions using epsilon-greedy policy
-        actions = agent.act(hetero_data, valid_action_masks, training=True)
+        # actions = agent.act(hetero_data, valid_action_masks, training=True)
+        actions = agent.act(hetero_data, state, valid_action_masks, training=True)
 
         # Take environment step
         next_state, rewards, dones, truncated, info = env.step(actions)
@@ -1091,7 +1432,10 @@ for episode in range(args.num_episodes):
         
         # # COMA : Store experience for this episode
         # episode_experiences.append((hetero_data, actions, rewards, next_hetero_data, dones))
-        agent.remember(hetero_data, actions, rewards, next_hetero_data, dones)
+        # agent.remember(hetero_data, actions, rewards, next_hetero_data, dones)\
+        team_reward = sum(rewards)
+        done_flag = all(dones)
+        agent.remember(hetero_data, state, actions, team_reward, next_hetero_data, next_state, done_flag)
 
         # Update state
         hetero_data = next_hetero_data
@@ -1101,14 +1445,18 @@ for episode in range(args.num_episodes):
         step += 1
         all_infos.append(info)
 
+        # if len(agent.memory) > batch_size:
+        #     loss_info = agent.replay(batch_size)
+        #     if loss_info:
+        #         episode_losses.append(loss_info.get('total_loss', 0))
         if len(agent.memory) > batch_size:
-            loss_info = agent.replay(batch_size)
-            if loss_info:
-                episode_losses.append(loss_info.get('total_loss', 0))
-
-    if episode % 20 == 0:
-        agent.update_target_network()  # Update target network every 20 episodes
-        print(f"Target network updated at episode {episode}")
+            learned = agent.learn()
+            if learned:
+                episode_losses.append(0.0)
+                
+    # if episode % 20 == 0:
+    #     agent.update_target_network()  # Update target network every 20 episodes
+    #     print(f"Target network updated at episode {episode}")
 
     # # ============ MODIFIED COMA TRAINING ============
     # # Add episode experiences to replay buffer
@@ -1163,9 +1511,9 @@ for episode in range(args.num_episodes):
     wandb.log({'episode': episode, 'avg_loss': avg_loss, 'overall_pick_rate': last_info.get('overall_pick_rate'), 'global_return': last_info.get('global_episode_return'), 'total_deliveries': last_info.get('total_deliveries'), 'clashes': last_info.get('total_clashes'), 'stuck': last_info.get('total_stuck')})
     
     # Optional: Clear old experiences periodically to prevent overfitting
-    if episode % 200 == 0 and episode > 0:
-        print(f"Clearing replay buffer at episode {episode}")
-        agent.memory.clear()
+    # if episode % 200 == 0 and episode > 0:
+    #     print(f"Clearing replay buffer at episode {episode}")
+    #     agent.re.clear()
 
     if episode % 100 == 0 and episode > 0:
         torch.save({
