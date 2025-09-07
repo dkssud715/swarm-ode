@@ -22,6 +22,8 @@ class HDF5Logger:
             self.file = h5py.File(self.filepath, 'w')
             
         # Episode 메타데이터 저장
+        if f'episode_{episode_id:06d}' in self.file:
+            del self.file[f'episode_{episode_id:06d}']  # (원하면 삭제 후 새로 만들기)
         ep_group = self.file.create_group(f'episode_{episode_id:06d}')
         self.current_episode_group = ep_group
         
@@ -325,38 +327,53 @@ def collect_data(env_id, num_episodes, seed):
     base_env = gym.make(env_id)
     env = LoggingWarehouseWrapper(base_env.unwrapped, f"warehouse_data_{env_id}_seed{seed}.h5")
     completed_episodes = 0
-    
-    for i in range(num_episodes):
-        start = time.time()
-        # 수정: wrapper를 통해 episode 실행
-        infos, global_episode_return, episode_returns = heuristic_episode_with_logging(
-            env, False, seed+i
-        )
-        end = time.time()
+    failed_episodes = 0
+    while completed_episodes < num_episodes:
+        try:
+            start = time.time()
+            # 수정: wrapper를 통해 episode 실행
+            infos, global_episode_return, episode_returns = heuristic_episode_with_logging(
+                env, False, seed+completed_episodes+failed_episodes
+            )
+            end = time.time()
+            
+            last_info = info_statistics(infos, global_episode_return, episode_returns)
+            last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
+            episode_length = len(infos)
+            print(f"Env: {env_id} | Seed: {seed} | Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}] | [FPS = {episode_length/(end-start):.2f}]")
+            completed_episodes += 1
+        except Exception as e:
+            print(f"Episode {seed+completed_episodes+failed_episodes}failed due to error: {e}")    
+            failed_episodes += 1
+        # start = time.time()
+        # # 수정: wrapper를 통해 episode 실행
+        # infos, global_episode_return, episode_returns = heuristic_episode_with_logging(
+        #     env, False, seed+completed_episodes
+        # )
+        # end = time.time()
         
-        last_info = info_statistics(infos, global_episode_return, episode_returns)
-        last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
-        episode_length = len(infos)
-        print(f"Env: {env_id} | Seed: {seed} | Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}] | [FPS = {episode_length/(end-start):.2f}]")
-        completed_episodes += 1
-    
+        # last_info = info_statistics(infos, global_episode_return, episode_returns)
+        # last_info["overall_pick_rate"] = last_info.get("total_deliveries") * 3600 / (5 * last_info['episode_length'])
+        # episode_length = len(infos)
+        # print(f"Env: {env_id} | Seed: {seed} | Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}] | [FPS = {episode_length/(end-start):.2f}]")
+        # completed_episodes += 1
     # 로거 종료
     env.logger.close()
 
 if __name__ == "__main__":
-    # environments = [
-    #     'tarware-tiny-3agvs-2pickers-partialobs-v1',
-    #     'tarware-small-6agvs-3pickers-partialobs-v1', 
-    #     'tarware-medium-10agvs-5pickers-partialobs-v1',
-    #     'tarware-medium-19agvs-9pickers-partialobs-v1',
-    #     'tarware-large-15agvs-8pickers-partialobs-v1'
-    # ]
     environments = [
+        # 'tarware-tiny-3agvs-2pickers-partialobs-v1',
         'tarware-small-6agvs-3pickers-partialobs-v1', 
         'tarware-medium-10agvs-5pickers-partialobs-v1',
         'tarware-medium-19agvs-9pickers-partialobs-v1',
         'tarware-large-15agvs-8pickers-partialobs-v1'
     ]
+    # environments = [
+    #     'tarware-small-6agvs-3pickers-partialobs-v1', 
+    #     'tarware-medium-10agvs-5pickers-partialobs-v1',
+    #     'tarware-medium-19agvs-9pickers-partialobs-v1',
+    #     'tarware-large-15agvs-8pickers-partialobs-v1'
+    # ]
     # environments = [
     #     'tarware-tiny-3agvs-2pickers-partialobs-v1']
     base_seeds = [0, 1000, 2000, 3000, 4000]
@@ -368,3 +385,4 @@ if __name__ == "__main__":
             # collect_data(env_id, num_episodes=1, seed=seed)
 
             print(f"Completed data collection for {env_id} with seed {seed}")
+    # collect_data(environments[0], num_episodes=200, seed=2000)

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import HeteroConv, GCNConv, GATConv, Linear
+from torch_geometric.nn import HeteroConv, SAGEConv, GATConv, Linear
 from torch_geometric.data import HeteroData, Batch
 # Import the converter from your code
 from torchdiffeq import odeint
@@ -29,7 +29,7 @@ class WarehouseDataLoader:
         self.converter = None
         
     def load_episode_data(self, episode_id: int) -> List[Dict]:
-        """Load single episode data"""
+        """Load single episode data and reconstruct observations"""
         with h5py.File(self.h5_file_path, 'r') as f:
             episode_group = f[f'episode_{episode_id:06d}']
             steps_group = episode_group['steps']
@@ -39,33 +39,63 @@ class WarehouseDataLoader:
             num_agvs = episode_group['metadata'].attrs['num_agvs']
             num_pickers = episode_group['metadata'].attrs['num_pickers']
             
-            # Initialize converter if not exists
-            if self.converter is None:
-                self.converter = MultiAgentGraphConverter(
-                    num_agvs=num_agvs,
-                    num_pickers=num_pickers,
-                    topk_tasks=5,
-                    max_comm_distance=5.0,
-                    max_task_distance=10.0
-                )
-            
             for step_name in sorted(steps_group.keys()):
                 step_data = steps_group[step_name]
                 
-                # Extract observations - this contains the graph features
-                if 'observations' in step_data:
-                    observations = step_data['observations'][:]
-                    # Convert to graph using your converter
-                    graph_data = self.converter._build_graph_from_observation(
-                        observations, rack_locations
+                # observations 재구성
+                observations = self._reconstruct_observations(step_data, num_agvs, num_pickers)
+                if self.converter is None:
+                    self.converter = MultiAgentGraphConverter(
+                        num_agvs=num_agvs,
+                        num_pickers=num_pickers,
+                        topk_tasks=5,
+                        max_comm_distance=5.0,
+                        max_task_distance=10.0
                     )
-                    episode_data.append({
-                        'graph': graph_data,
-                        'raw_obs': observations,
-                        'step_id': int(step_name.split('_')[1])
-                    })
-                    
+                # Convert to graph
+                graph_data = self.converter._build_graph_from_observation(
+                    observations, rack_locations
+                )
+                episode_data.append({
+                    'graph': graph_data,
+                    'raw_obs': observations,
+                    'step_id': int(step_name.split('_')[1])
+                })
+                
             return episode_data
+
+    def _reconstruct_observations(self, step_data, num_agvs, num_pickers):
+        """간단한 observation 재구성"""
+        positions = step_data['agent_positions'][:]
+        shelf_info = step_data['shelf_request_info'][:]
+        empty_info = step_data['empty_shelf_info'][:]
+        
+        # 모든 agent는 동일한 길이의 observation을 가져야 함
+        base_obs_length = 7 + 4 * (num_agvs + num_pickers - 1) + len(shelf_info) * 2
+        
+        observations = []
+        for i in range(num_agvs + num_pickers):
+            obs = [0] * base_obs_length  # 고정 길이 배열 생성
+            
+            if i < num_agvs:  # AGV
+                obs[0] = 0  # carrying_shelf
+                obs[3] = positions[i][1]  # pos_y
+                obs[4] = positions[i][0]  # pos_x
+            else:  # Picker
+                obs[0] = positions[i][1]  # pos_y
+                obs[1] = positions[i][0]  # pos_x
+                
+            # 첫 번째 agent에만 전체 정보 저장
+            if i == 0:
+                # shelf 데이터를 마지막에 추가
+                shelf_start_idx = base_obs_length - len(shelf_info) * 2
+                for j, (empty, requested) in enumerate(zip(empty_info, shelf_info)):
+                    obs[shelf_start_idx + j*2] = empty
+                    obs[shelf_start_idx + j*2 + 1] = requested
+                    
+            observations.append(obs)
+        
+        return observations
     
     def create_trajectory_sequences(self, episode_data: List[Dict]) -> List[TrajectoryBatch]:
         """Create sequences for trajectory prediction"""
@@ -128,12 +158,12 @@ class HeteroGraphODEFunc(nn.Module):
         
         # Heterogeneous graph convolution layers
         self.conv1 = HeteroConv({
-            edge_type: GCNConv(-1, hidden_dim) 
+            edge_type: SAGEConv(-1, hidden_dim) 
             for edge_type in edge_types
         }, aggr='sum')
         
         self.conv2 = HeteroConv({
-            edge_type: GCNConv(hidden_dim, hidden_dim) 
+            edge_type: SAGEConv(hidden_dim, hidden_dim) 
             for edge_type in edge_types  
         }, aggr='sum')
         
@@ -228,15 +258,20 @@ class WarehouseGraphODE(nn.Module):
         self.ode_func.set_graph_structure(edge_index_dict)
         
         # Encode initial node features
-        x0_dict = {}
+        # x0_dict = {}
+        # for node_type in hetero_data.node_types:
+        #     if node_type in self.encoders and hetero_data[node_type].num_nodes > 0:
+        #         x0_dict[node_type] = self.encoders[node_type](hetero_data[node_type].x)
+        x0 = []
         for node_type in hetero_data.node_types:
             if node_type in self.encoders and hetero_data[node_type].num_nodes > 0:
-                x0_dict[node_type] = self.encoders[node_type](hetero_data[node_type].x)
-        
+                x0.append(self.encoders[node_type](hetero_data[node_type].x))
+
+        x0 = torch.cat(x0, dim=0)
         # Solve ODE
         trajectory_dict = odeint(
             self.ode_func, 
-            x0_dict, 
+            x0, # x0_dict,
             time_steps,
             method=self.method
         )
@@ -375,270 +410,322 @@ class WarehouseTrajectoryPredictor:
         plt.tight_layout()
         plt.show()
 
-class MultiAgentGraphConverter:
-    def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
+# class MultiAgentGraphConverter:
+#     def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
 
-        # Parameters for the graph observation space
-        self.topk_tasks = topk_tasks
-        self.max_comm_distance = max_comm_distance
-        self.max_task_distance = max_task_distance
+#         # Parameters for the graph observation space
+#         self.topk_tasks = topk_tasks
+#         self.max_comm_distance = max_comm_distance
+#         self.max_task_distance = max_task_distance
 
-        # Node counts
-        self.num_agv_nodes = num_agvs
-        self.num_picker_nodes = num_pickers
-        self.num_location_nodes = None
+#         # Node counts
+#         self.num_agv_nodes = num_agvs
+#         self.num_picker_nodes = num_pickers
+#         self.num_location_nodes = None
 
-        # Node feature dimensions
-        self.agv_feature_dim = 7 # [carrying_shelf, carrying_requested, toggle_loading, pos_y, pos_x, target_y, target_x]
-        self.picker_feature_dim = 4 # [pos_y, pos_x, target_y, target_x]
-        self.location_feature_dim = 2 # [has_shelf, is_requested]
+#         # Node feature dimensions
+#         self.agv_feature_dim = 7 # [carrying_shelf, carrying_requested, toggle_loading, pos_y, pos_x, target_y, target_x]
+#         self.picker_feature_dim = 4 # [pos_y, pos_x, target_y, target_x]
+#         self.location_feature_dim = 2 # [has_shelf, is_requested]
 
-        # Store extracted info from environment
-        self._current_agents_info = []
-        self._current_shelves_info = []
-        self._rack_locations = []
+#         # Store extracted info from environment
+#         self._current_agents_info = []
+#         self._current_shelves_info = []
+#         self._rack_locations = []
 
-        # Graph components
-        self.node_features = None
-        self.edge_index = None
-        self.edge_features = None
-        self.node_types = None
+#         # Graph components
+#         self.node_features = None
+#         self.edge_index = None
+#         self.edge_features = None
+#         self.node_types = None
 
-        self.position_to_sections = {}
+#         self.position_to_sections = {}
 
-    def _build_graph_from_observation(self, observation, rack_locations):
-        self.num_location_nodes = len(rack_locations)
-        self._rack_locations = []
-        self._rack_locations = rack_locations
-        agv_features = []
-        picker_features = []
-        location_features = []
-        self.position_to_sections = {}
-        # Reset agent and shelf info for this step
-        self._current_agents_info = []
-        self._current_shelves_info = []
+#     def _build_graph_from_observation(self, observation, rack_locations):
+#         self.num_location_nodes = len(rack_locations)
+#         self._rack_locations = []
+#         self._rack_locations = rack_locations
+#         agv_features = []
+#         picker_features = []
+#         location_features = []
+#         self.position_to_sections = {}
+#         # Reset agent and shelf info for this step
+#         self._current_agents_info = []
+#         self._current_shelves_info = []
         
-        # Extract node features from current_agents_info
-        agv_count= 0
-        picker_count = 0
+#         # Extract node features from current_agents_info
+#         agv_count= 0
+#         picker_count = 0
 
-        for agent_id, obs in enumerate(observation):
-            if agent_id < self.num_agv_nodes:
-                agv_feature = observation[agent_id][:self.agv_feature_dim].tolist()
-                self._current_agents_info.append(agv_feature)
-                agv_features.append(agv_feature)
-                agv_count += 1
-            else:
-                picker_feature = observation[agent_id][:self.picker_feature_dim].tolist()
-                self._current_agents_info.append(picker_feature)
-                picker_features.append(picker_feature)
-                picker_count += 1
+#         for agent_id, obs in enumerate(observation):
+#             if agent_id < self.num_agv_nodes:
+#                 agv_feature = obs[:self.agv_feature_dim]
+#                 self._current_agents_info.append(agv_feature)
+#                 agv_features.append(agv_feature)
+#                 agv_count += 1
+#             else:
+#                 picker_feature = obs[:self.picker_feature_dim]
+#                 self._current_agents_info.append(picker_feature)
+#                 picker_features.append(picker_feature)
+#                 picker_count += 1
         
-        # Extract task features from current_shelves_info
-        shelf_data = observation[0][7+4*(self.num_agv_nodes+self.num_picker_nodes-1):]  # Start after AGV features
-        for i in range(0, len(shelf_data), 2):
-            location_features.append([shelf_data[i], shelf_data[i+1]])
-            self._current_shelves_info.extend([shelf_data[i], shelf_data[i+1]])  # has_shelf, is_requested
+#         # Extract task features from current_shelves_info
+#         shelf_data = observation[0][7+4*(self.num_agv_nodes+self.num_picker_nodes-1):]  # Start after AGV features
+#         for i in range(0, len(shelf_data), 2):
+#             location_features.append([shelf_data[i], shelf_data[i+1]])
+#             self._current_shelves_info.extend([shelf_data[i], shelf_data[i+1]])  # has_shelf, is_requested
         
-        # build edges dynamically based on the environment
-        self.edge_list = self._build_edges() #  edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges]
+#         # build edges dynamically based on the environment
+#         self.edge_list = self._build_edges() #  edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges]
 
-        for (x, y, group_idx) in self._rack_locations:
-                self.position_to_sections[(x, y)] = group_idx
+#         for (x, y, group_idx) in self._rack_locations:
+#                 self.position_to_sections[(x, y)] = group_idx
 
-        data = HeteroData()
-        if agv_features:
-            data['agv'].num_nodes = self.num_agv_nodes
-            data['agv'].x = torch.tensor(agv_features, dtype=torch.float32)
-        else:
-            data['agv'].num_nodes = 0
-            data['agv'].x = torch.empty((0, self.agv_feature_dim), dtype=torch.float32)
+#         data = HeteroData()
+#         if agv_features:
+#             data['agv'].num_nodes = self.num_agv_nodes
+#             data['agv'].x = torch.tensor(agv_features, dtype=torch.float32)
+#         else:
+#             data['agv'].num_nodes = 0
+#             data['agv'].x = torch.empty((0, self.agv_feature_dim), dtype=torch.float32)
         
-        if picker_features:
-            data['picker'].num_nodes = self.num_picker_nodes
-            data['picker'].x = torch.tensor(picker_features, dtype=torch.float32)
-        else:
-            data['picker'].num_nodes = 0
-            data['picker'].x = torch.empty((0, self.picker_feature_dim), dtype=torch.float32)
+#         if picker_features:
+#             data['picker'].num_nodes = self.num_picker_nodes
+#             data['picker'].x = torch.tensor(picker_features, dtype=torch.float32)
+#         else:
+#             data['picker'].num_nodes = 0
+#             data['picker'].x = torch.empty((0, self.picker_feature_dim), dtype=torch.float32)
 
-        if location_features:
-            data['location'].num_nodes = self.num_location_nodes
-            data['location'].x = torch.tensor(location_features, dtype=torch.float32)
-        else:
-            data['location'].num_nodes = 0
-            data['location'].x = torch.empty((0, self.location_feature_dim), dtype=torch.float32)
+#         if location_features:
+#             data['location'].num_nodes = self.num_location_nodes
+#             data['location'].x = torch.tensor(location_features, dtype=torch.float32)
+#         else:
+#             data['location'].num_nodes = 0
+#             data['location'].x = torch.empty((0, self.location_feature_dim), dtype=torch.float32)
         
-        if self.edge_list[0]:  # agv2location_edges
-            data['agv', 'targets', 'location'].edge_index = torch.tensor(self.edge_list[0], dtype=torch.long).t().contiguous()
-        else:
-            data['agv', 'targets', 'location'].edge_index = torch.empty((2, 0), dtype=torch.long)
-        if self.edge_list[1]:  # location2agv_edges
-            data['location', 'is targeted by', 'agv'].edge_index = torch.tensor(self.edge_list[1], dtype=torch.long).t().contiguous()
-        else:
-            data['location', 'is targeted by', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
-        if self.edge_list[2]:  # agv2agv_edges
-            data['agv', 'communicates', 'agv'].edge_index = torch.tensor(self.edge_list[2], dtype=torch.long).t().contiguous()
-        else:
-            data['agv', 'communicates', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
-        if self.edge_list[3]:  # picker2location_edges
-            data['picker', 'manages', 'location'].edge_index = torch.tensor(self.edge_list[3], dtype=torch.long).t().contiguous()
-        else:
-            data['picker', 'manages', 'location'].edge_index = torch.empty((2, 0), dtype=torch.long)
-        if self.edge_list[4]:  # agv2picker_edges
-            data['agv', 'cooperates with', 'picker'].edge_index = torch.tensor(self.edge_list[4], dtype=torch.long).t().contiguous()
-        else:
-            data['agv', 'cooperates with', 'picker'].edge_index = torch.empty((2, 0), dtype=torch.long)
-        if self.edge_list[5]:  # picker2agv_edges
-            data['picker', 'helps', 'agv'].edge_index = torch.tensor(self.edge_list[5], dtype=torch.long).t().contiguous()
-        else:
-            data['picker', 'helps', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
+#         if self.edge_list[0]:  # agv2location_edges
+#             data['agv', 'targets', 'location'].edge_index = torch.tensor(self.edge_list[0], dtype=torch.long).t().contiguous()
+#         else:
+#             data['agv', 'targets', 'location'].edge_index = torch.empty((2, 0), dtype=torch.long)
+#         if self.edge_list[1]:  # location2agv_edges
+#             data['location', 'is targeted by', 'agv'].edge_index = torch.tensor(self.edge_list[1], dtype=torch.long).t().contiguous()
+#         else:
+#             data['location', 'is targeted by', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
+#         if self.edge_list[2]:  # agv2agv_edges
+#             data['agv', 'communicates', 'agv'].edge_index = torch.tensor(self.edge_list[2], dtype=torch.long).t().contiguous()
+#         else:
+#             data['agv', 'communicates', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
+#         if self.edge_list[3]:  # picker2location_edges
+#             data['picker', 'manages', 'location'].edge_index = torch.tensor(self.edge_list[3], dtype=torch.long).t().contiguous()
+#         else:
+#             data['picker', 'manages', 'location'].edge_index = torch.empty((2, 0), dtype=torch.long)
+#         if self.edge_list[4]:  # agv2picker_edges
+#             data['agv', 'cooperates with', 'picker'].edge_index = torch.tensor(self.edge_list[4], dtype=torch.long).t().contiguous()
+#         else:
+#             data['agv', 'cooperates with', 'picker'].edge_index = torch.empty((2, 0), dtype=torch.long)
+#         if self.edge_list[5]:  # picker2agv_edges
+#             data['picker', 'helps', 'agv'].edge_index = torch.tensor(self.edge_list[5], dtype=torch.long).t().contiguous()
+#         else:
+#             data['picker', 'helps', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
 
-        return data
+#         return data
     
-    def _build_edges(self):
-        # AGV-to-Task Edges
-        agv2location_edges, location2agv_edges = self._build_agv_to_location_edges()
-        # AGV-to-AGV Edges  
-        agv2agv_edges = self._build_agv_to_agv_edges()
-        # Picker-to-Task Edges
-        picker2location_edges = self._build_picker_to_location_edges()
-        # AGV-to-Picker Edges
-        agv2picker_edges, picker2agv_edges = self._build_agv_to_picker_edges()
+#     def _build_edges(self):
+#         # AGV-to-Task Edges
+#         agv2location_edges, location2agv_edges = self._build_agv_to_location_edges()
+#         # AGV-to-AGV Edges  
+#         agv2agv_edges = self._build_agv_to_agv_edges()
+#         # Picker-to-Task Edges
+#         picker2location_edges = self._build_picker_to_location_edges()
+#         # AGV-to-Picker Edges
+#         agv2picker_edges, picker2agv_edges = self._build_agv_to_picker_edges()
         
-        edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges, picker2agv_edges]
-        return edge_list       
+#         edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges, picker2agv_edges]
+#         return edge_list       
 
-    def _build_agv_to_location_edges(self):
-        agv2location_edges = []
-        location2agv_edges = []
-        for agv_idx in range(self.num_agv_nodes):
-            agent_info = self._current_agents_info[agv_idx]
+#     def _build_agv_to_location_edges(self):
+#         agv2location_edges = []
+#         location2agv_edges = []
+#         for agv_idx in range(self.num_agv_nodes):
+#             agent_info = self._current_agents_info[agv_idx]
 
-            agv_target = np.array([agent_info[5], agent_info[6]]) # target_y, target_x
-            has_target = not (agv_target[0] ==0 and agv_target[1] == 0)
+#             agv_target = np.array([agent_info[5], agent_info[6]]) # target_y, target_x
+#             has_target = not (agv_target[0] ==0 and agv_target[1] == 0)
 
-            if has_target:
-                for loc_idx, rack_pos in enumerate(self._rack_locations):
-                    if rack_pos[0]  == agv_target[1] and rack_pos[1] == agv_target[0]:
-                        agv2location_edges.extend([(agv_idx, loc_idx)])
-                        location2agv_edges.extend([(loc_idx, agv_idx)])
-                        break
-            else:
-                for location_idx, _ in enumerate(self._rack_locations):
-                    location_info = self._current_shelves_info[location_idx * 2: (location_idx + 1) * 2]
-                    has_shelf = location_info[0]
-                    is_requested = location_info[1]
-                    if has_shelf and is_requested:
-                        agv2location_edges.extend([(agv_idx, location_idx)])
-                        location2agv_edges.extend([(location_idx, agv_idx)])
+#             if has_target:
+#                 for loc_idx, rack_pos in enumerate(self._rack_locations):
+#                     if rack_pos[0]  == agv_target[1] and rack_pos[1] == agv_target[0]:
+#                         agv2location_edges.extend([(agv_idx, loc_idx)])
+#                         location2agv_edges.extend([(loc_idx, agv_idx)])
+#                         break
+#             else:
+#                 for location_idx, _ in enumerate(self._rack_locations):
+#                     location_info = self._current_shelves_info[location_idx * 2: (location_idx + 1) * 2]
+#                     has_shelf = location_info[0]
+#                     is_requested = location_info[1]
+#                     if has_shelf and is_requested:
+#                         agv2location_edges.extend([(agv_idx, location_idx)])
+#                         location2agv_edges.extend([(location_idx, agv_idx)])
 
-        return agv2location_edges, location2agv_edges
+#         return agv2location_edges, location2agv_edges
     
-    def _build_agv_to_agv_edges(self):
-        """ Build AGV-to-AGV edges : distance  """
-        agv2agv_edges = []
-        for i in range(self.num_agv_nodes):
-            for j in range(i+1, self.num_agv_nodes):
-                agent_i_info = self._current_agents_info[i]
-                agent_j_info = self._current_agents_info[j]
+#     def _build_agv_to_agv_edges(self):
+#         """ Build AGV-to-AGV edges : distance  """
+#         agv2agv_edges = []
+#         for i in range(self.num_agv_nodes):
+#             for j in range(i+1, self.num_agv_nodes):
+#                 agent_i_info = self._current_agents_info[i]
+#                 agent_j_info = self._current_agents_info[j]
 
-                pos_i = np.array([agent_i_info[4], agent_i_info[3]]) # pos_x, pos_y
-                pos_j = np.array([agent_j_info[4], agent_j_info[3]]) # pos_x, pos_y
+#                 pos_i = np.array([agent_i_info[4], agent_i_info[3]]) # pos_x, pos_y
+#                 pos_j = np.array([agent_j_info[4], agent_j_info[3]]) # pos_x, pos_y
 
-                target_i = np.array([agent_i_info[6], agent_i_info[5]]) # target_x, target_y
-                target_j = np.array([agent_j_info[6], agent_j_info[5]]) # target_x, target_y
+#                 target_i = np.array([agent_i_info[6], agent_i_info[5]]) # target_x, target_y
+#                 target_j = np.array([agent_j_info[6], agent_j_info[5]]) # target_x, target_y
 
-                dist = np.linalg.norm(pos_i - pos_j, ord=1)
+#                 dist = np.linalg.norm(pos_i - pos_j, ord=1)
 
-                has_target_i = not (target_i[0] == 0 and target_i[1] == 0)
-                has_target_j = not (target_j[0] == 0 and target_j[1] == 0)
-                same_section = False
-                if has_target_i and has_target_j:
-                    same_section = self._check_same_rack_group(target_i, target_j)
+#                 has_target_i = not (target_i[0] == 0 and target_i[1] == 0)
+#                 has_target_j = not (target_j[0] == 0 and target_j[1] == 0)
+#                 same_section = False
+#                 if has_target_i and has_target_j:
+#                     same_section = self._check_same_rack_group(target_i, target_j)
 
-                if i != j and (dist <= self.max_comm_distance or same_section):
-                    agv2agv_edges.extend([(i, j), (j, i)])
+#                 if i != j and (dist <= self.max_comm_distance or same_section):
+#                     agv2agv_edges.extend([(i, j), (j, i)])
 
-        return agv2agv_edges
+#         return agv2agv_edges
 
-    def _build_picker_to_location_edges(self):
-        """Build Picker-Task edges: zone-based + assigned tasks"""
-        picker2location_edges = []
-        for picker_idx in range(self.num_picker_nodes):
-            agent_info = self._current_agents_info[self.num_agv_nodes + picker_idx]
+#     def _build_picker_to_location_edges(self):
+#         """Build Picker-Task edges: zone-based + assigned tasks"""
+#         picker2location_edges = []
+#         for picker_idx in range(self.num_picker_nodes):
+#             agent_info = self._current_agents_info[self.num_agv_nodes + picker_idx]
             
-            # Get picker position and target
-            picker_pos = np.array([agent_info[1], agent_info[0]])  # pos_x, pos_y
-            picker_target = np.array([agent_info[3], agent_info[2]])  # target_x, target_y
-            has_target = not (picker_target[0] == 0 and picker_target[1] == 0)
+#             # Get picker position and target
+#             picker_pos = np.array([agent_info[1], agent_info[0]])  # pos_x, pos_y
+#             picker_target = np.array([agent_info[3], agent_info[2]])  # target_x, target_y
+#             has_target = not (picker_target[0] == 0 and picker_target[1] == 0)
             
-            picker_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
+#             picker_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
 
-            for loc_idx, rack_pos in enumerate(self._rack_locations): # rack_pos is (x, y) format
-                shelf_info = self._current_shelves_info[loc_idx * 2: (loc_idx + 1) * 2]
-                loc_section = self.position_to_sections.get(rack_pos, None)
-                has_shelf = shelf_info[0]
-                is_requested = shelf_info[1]
+#             for loc_idx, rack_pos in enumerate(self._rack_locations): # rack_pos is (x, y) format
+#                 shelf_info = self._current_shelves_info[loc_idx * 2: (loc_idx + 1) * 2]
+#                 loc_section = self.position_to_sections.get((rack_pos[0], rack_pos[1]), None)
+#                 has_shelf = shelf_info[0]
+#                 is_requested = shelf_info[1]
 
-                if has_target and (rack_pos == picker_target):
-                    picker2location_edges.append((picker_idx, loc_idx))
-                elif not has_target and picker_section == loc_section and (has_shelf and is_requested):
-                    picker2location_edges.append((picker_idx, loc_idx))
+#                 if has_target and (rack_pos == picker_target):
+#                     picker2location_edges.append((picker_idx, loc_idx))
+#                 elif not has_target and picker_section == loc_section and (has_shelf and is_requested):
+#                     picker2location_edges.append((picker_idx, loc_idx))
         
-        return picker2location_edges
+#         return picker2location_edges
     
-    def _build_agv_to_picker_edges(self):
-        """Build AGV-Picker edges: cooperation based"""
-        agv2picker_edges = []
-        picker2agv_edges = []
+#     def _build_agv_to_picker_edges(self):
+#         """Build AGV-Picker edges: cooperation based"""
+#         agv2picker_edges = []
+#         picker2agv_edges = []
 
-        for agv_idx in range(self.num_agv_nodes):
-            for picker_idx in range(self.num_picker_nodes):
-                agv_info = self._current_agents_info[agv_idx]
-                picker_info = self._current_agents_info[self.num_agv_nodes + picker_idx]
+#         for agv_idx in range(self.num_agv_nodes):
+#             for picker_idx in range(self.num_picker_nodes):
+#                 agv_info = self._current_agents_info[agv_idx]
+#                 picker_info = self._current_agents_info[self.num_agv_nodes + picker_idx]
                 
-                # Get positions and targets
-                agv_pos = np.array([agv_info[4], agv_info[3]]) # pos_x, pos_y
-                picker_pos = np.array([picker_info[1], picker_info[0]]) # pos_x, pos_y
-                agv_target = np.array([agv_info[6], agv_info[5]]) # target_x, target_y
-                picker_target = np.array([picker_info[3], picker_info[2]]) # target_x, target_y
+#                 # Get positions and targets
+#                 agv_pos = np.array([agv_info[4], agv_info[3]]) # pos_x, pos_y
+#                 picker_pos = np.array([picker_info[1], picker_info[0]]) # pos_x, pos_y
+#                 agv_target = np.array([agv_info[6], agv_info[5]]) # target_x, target_y
+#                 picker_target = np.array([picker_info[3], picker_info[2]]) # target_x, target_y
                 
-                # Check cooperation conditions
+#                 # Check cooperation conditions
                 
-                # Condition 1: Spatial proximity
-                dist = np.linalg.norm(agv_pos - picker_pos, ord=1)
-                close_proximity = dist <= self.max_comm_distance
+#                 # Condition 1: Spatial proximity
+#                 dist = np.linalg.norm(agv_pos - picker_pos, ord=1)
+#                 close_proximity = dist <= self.max_comm_distance
 
-                # Condition 2: Same target section coordination
-                has_picker_taget = not (picker_target[0] == 0 and picker_target[1] == 0)
-                has_agv_target = not (agv_target[0] == 0 and agv_target[1] == 0)
-                same_target = False
-                same_target_section = False
-                agv_target_in_picker_section = False
-                if has_agv_target and has_picker_taget:
-                    same_target = picker_target[0] == agv_target[0] and picker_target[1] == agv_target[1]
-                    if not same_target:
-                        agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
-                        picker_target_section = self.position_to_sections.get((picker_target[0], picker_target[1]), None)
-                        if agv_target_section is not None and picker_target_section is not None:
-                            same_target_section = agv_target_section == picker_target_section
+#                 # Condition 2: Same target section coordination
+#                 has_picker_taget = not (picker_target[0] == 0 and picker_target[1] == 0)
+#                 has_agv_target = not (agv_target[0] == 0 and agv_target[1] == 0)
+#                 same_target = False
+#                 same_target_section = False
+#                 agv_target_in_picker_section = False
+#                 if has_agv_target and has_picker_taget:
+#                     same_target = picker_target[0] == agv_target[0] and picker_target[1] == agv_target[1]
+#                     if not same_target:
+#                         agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
+#                         picker_target_section = self.position_to_sections.get((picker_target[0], picker_target[1]), None)
+#                         if agv_target_section is not None and picker_target_section is not None:
+#                             same_target_section = agv_target_section == picker_target_section
 
+#                 else:
+#                     picker_current_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
+#                     if has_agv_target:
+#                         agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
+#                         agv_target_in_picker_section = picker_current_section == agv_target_section
+                
+#                 if close_proximity or same_target or same_target_section or agv_target_in_picker_section:
+#                     agv2picker_edges.append((agv_idx, picker_idx))
+#                     picker2agv_edges.append((picker_idx, agv_idx))
+        
+#         return agv2picker_edges, picker2agv_edges
+    
+#     def _check_same_rack_group(self, pos_i, pos_j):
+#         group_i = self.position_to_sections.get((pos_i[0], pos_i[1]), None)
+#         group_j = self.position_to_sections.get((pos_j[0], pos_j[1]), None)
+#         return (group_i is not None and group_j is not None and group_i == group_j)
+
+
+
+def check_h5_structure(file_path):
+    with h5py.File(file_path, 'r') as f:
+        print("File contents:")
+        def print_structure(name, obj):
+            if isinstance(obj, h5py.Group):
+                print(f"Group: {name}")
+            else:
+                print(f"Dataset: {name}, shape: {obj.shape}")
+        
+        f.visititems(print_structure)
+        
+        # Episode 개수 확인
+        episodes = [key for key in f.keys() if key.startswith('episode_')]
+        print(f"Found episodes: {len(episodes)}")
+        
+        if episodes:
+            ep = f[episodes[0]]
+            if 'steps' in ep:
+                steps = list(ep['steps'].keys())
+                print(f"Steps in first episode: {len(steps)}")
+                
+                if steps and 'observations' in ep['steps'][steps[0]]:
+                    obs_shape = ep['steps'][steps[0]]['observations'].shape
+                    print(f"Observation shape: {obs_shape}")
                 else:
-                    picker_current_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
-                    if has_agv_target:
-                        agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
-                        agv_target_in_picker_section = picker_current_section == agv_target_section
-                
-                if close_proximity or same_target or same_target_section or agv_target_in_picker_section:
-                    agv2picker_edges.append((agv_idx, picker_idx))
-                    picker2agv_edges.append((picker_idx, agv_idx))
+                    print("No observations found in steps!")
+            else:
+                print("No steps found in episode!")
+
+def debug_episode_loading(loader, episode_id=0):
+    try:
+        episode_data = loader.load_episode_data(episode_id)
+        print(f"Loaded episode data: {len(episode_data)} steps")
         
-        return agv2picker_edges, picker2agv_edges
-    
-    def _check_same_rack_group(self, pos_i, pos_j):
-        group_i = self.position_to_sections.get((pos_i[0], pos_i[1]), None)
-        group_j = self.position_to_sections.get((pos_j[0], pos_j[1]), None)
-        return (group_i is not None and group_j is not None and group_i == group_j)
+        if episode_data:
+            first_step = episode_data[0]
+            print(f"First step keys: {first_step.keys()}")
+            if 'graph' in first_step:
+                graph = first_step['graph']
+                print(f"Graph node types: {list(graph.node_types)}")
+                for node_type in graph.node_types:
+                    print(f"{node_type} nodes: {graph[node_type].num_nodes}")
+        else:
+            print("No episode data loaded!")
+            
+    except Exception as e:
+        print(f"Error loading episode: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Usage Example
 if __name__ == "__main__":
@@ -650,12 +737,14 @@ if __name__ == "__main__":
     #     'tarware-medium-19agvs-9pickers-partialobs-v1',
     #     'tarware-large-15agvs-8pickers-partialobs-v1'
     # ]
-    h5_file_path = "tarware-tiny-3agvs-2pickers-partialobs-v1_seed0.h5"
+    h5_file_path = "./warehouse_data_tarware-tiny-3agvs-2pickers-partialobs-v1_seed0.h5"
     predictor = WarehouseTrajectoryPredictor(h5_file_path, hidden_dim=64)
     
     # Train on first episode
     print("Training Graph ODE model...")
-    predictor.train_episode(episode_id=0, num_epochs=100)
+    for episode_id in range(200):
+        print(f"Training on episode {episode_id}...")
+        predictor.train_episode(episode_id=0, num_epochs=100)
     
     # Load test data
     test_episode_data = predictor.data_loader.load_episode_data(episode_id=1)
@@ -667,8 +756,8 @@ if __name__ == "__main__":
         predicted_trajectories = predictor.predict_trajectory(test_graph, num_steps=15)
         
         # Visualize
-        print("Visualizing predictions...")
-        predictor.visualize_predictions(test_graph, predicted_trajectories)
+        # print("Visualizing predictions...")
+        # predictor.visualize_predictions(test_graph, predicted_trajectories)
         
         # Print trajectory statistics
         for node_type, traj in predicted_trajectories.items():
