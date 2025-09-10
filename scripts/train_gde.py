@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch_geometric.nn import HeteroConv, SAGEConv, GATConv, Linear
-from torch_geometric.data import HeteroData, Batch
+from torch_geometric.data import HeteroData, Batch, Data
 # Import the converter from your code
 from torchdiffeq import odeint
 import h5py
@@ -10,672 +11,420 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
-from collections import defaultdict
+from collections import defaultdict, deque
 
-@dataclass
-class TrajectoryBatch:
-    """Batch of trajectory data for training"""
-    hetero_data: HeteroData  # Graph data
-    trajectories: Dict[str, torch.Tensor]  # Node type -> [B, T, N, F] trajectories
-    time_steps: torch.Tensor  # [T] time points
-    
-class WarehouseDataLoader:
-    """Loads and preprocesses warehouse trajectory data"""
-    
-    def __init__(self, h5_file_path: str, sequence_length: int = 10, prediction_horizon: int = 5):
-        self.h5_file_path = h5_file_path
-        self.sequence_length = sequence_length
-        self.prediction_horizon = prediction_horizon
-        self.converter = None
-        
-    def load_episode_data(self, episode_id: int) -> List[Dict]:
-        """Load single episode data and reconstruct observations"""
-        with h5py.File(self.h5_file_path, 'r') as f:
-            episode_group = f[f'episode_{episode_id:06d}']
-            steps_group = episode_group['steps']
-            
-            episode_data = []
-            rack_locations = episode_group['metadata/rack_locations'][:]
-            num_agvs = episode_group['metadata'].attrs['num_agvs']
-            num_pickers = episode_group['metadata'].attrs['num_pickers']
-            
-            for step_name in sorted(steps_group.keys()):
-                step_data = steps_group[step_name]
-                
-                # observations 재구성
-                observations = self._reconstruct_observations(step_data, num_agvs, num_pickers)
-                if self.converter is None:
-                    self.converter = MultiAgentGraphConverter(
-                        num_agvs=num_agvs,
-                        num_pickers=num_pickers,
-                        topk_tasks=5,
-                        max_comm_distance=5.0,
-                        max_task_distance=10.0
-                    )
-                # Convert to graph
-                graph_data = self.converter._build_graph_from_observation(
-                    observations, rack_locations
-                )
-                episode_data.append({
-                    'graph': graph_data,
-                    'raw_obs': observations,
-                    'step_id': int(step_name.split('_')[1])
-                })
-                
-            return episode_data
-
-    def _reconstruct_observations(self, step_data, num_agvs, num_pickers):
-        """간단한 observation 재구성"""
-        positions = step_data['agent_positions'][:]
-        shelf_info = step_data['shelf_request_info'][:]
-        empty_info = step_data['empty_shelf_info'][:]
-        
-        # 모든 agent는 동일한 길이의 observation을 가져야 함
-        base_obs_length = 7 + 4 * (num_agvs + num_pickers - 1) + len(shelf_info) * 2
-        
-        observations = []
-        for i in range(num_agvs + num_pickers):
-            obs = [0] * base_obs_length  # 고정 길이 배열 생성
-            
-            if i < num_agvs:  # AGV
-                obs[0] = 0  # carrying_shelf
-                obs[3] = positions[i][1]  # pos_y
-                obs[4] = positions[i][0]  # pos_x
-            else:  # Picker
-                obs[0] = positions[i][1]  # pos_y
-                obs[1] = positions[i][0]  # pos_x
-                
-            # 첫 번째 agent에만 전체 정보 저장
-            if i == 0:
-                # shelf 데이터를 마지막에 추가
-                shelf_start_idx = base_obs_length - len(shelf_info) * 2
-                for j, (empty, requested) in enumerate(zip(empty_info, shelf_info)):
-                    obs[shelf_start_idx + j*2] = empty
-                    obs[shelf_start_idx + j*2 + 1] = requested
-                    
-            observations.append(obs)
-        
-        return observations
-    
-    def create_trajectory_sequences(self, episode_data: List[Dict]) -> List[TrajectoryBatch]:
-        """Create sequences for trajectory prediction"""
-        sequences = []
-        
-        for i in range(len(episode_data) - self.sequence_length - self.prediction_horizon + 1):
-            # Input sequence
-            input_graphs = [episode_data[i + j]['graph'] for j in range(self.sequence_length)]
-            
-            # Target sequence  
-            target_graphs = [episode_data[i + self.sequence_length + j]['graph'] 
-                           for j in range(self.prediction_horizon)]
-            
-            # Extract trajectories from graph features
-            trajectories = self._extract_trajectories(input_graphs + target_graphs)
-            
-            # Use the last input graph as the graph structure
-            hetero_data = input_graphs[-1]
-            
-            sequences.append(TrajectoryBatch(
-                hetero_data=hetero_data,
-                trajectories=trajectories,
-                time_steps=torch.linspace(0, 1, self.sequence_length + self.prediction_horizon)
-            ))
-            
-        return sequences
-    
-    def _extract_trajectories(self, graphs: List[HeteroData]) -> Dict[str, torch.Tensor]:
-        """Extract position trajectories from graph sequence"""
-        trajectories = {}
-        
-        for node_type in ['agv', 'picker']:
-            if node_type in graphs[0]:
-                node_trajs = []
-                for graph in graphs:
-                    if node_type == 'agv':
-                        # AGV features: [carrying_shelf, carrying_requested, toggle_loading, pos_y, pos_x, target_y, target_x]
-                        positions = graph[node_type].x[:, [4, 3]]  # [pos_x, pos_y]
-                    else:  # picker
-                        # Picker features: [pos_y, pos_x, target_y, target_x]
-                        positions = graph[node_type].x[:, [1, 0]]  # [pos_x, pos_y]
-                    node_trajs.append(positions)
-                
-                # Stack: [T, N, 2]
-                trajectories[node_type] = torch.stack(node_trajs, dim=0)
-        
-        return trajectories
-
-class HeteroGraphODEFunc(nn.Module):
-    """Heterogeneous Graph ODE Function"""
-    
-    def __init__(self, 
-                 node_dims: Dict[str, int],
-                 edge_types: List[Tuple[str, str, str]],
-                 hidden_dim: int = 64):
+class GraphODEFunc(nn.Module):    
+    def __init__(self, node_dim: int, hidden_dim: int = 64, num_layers: int = 2):
         super().__init__()
-        self.node_dims = node_dims
-        self.edge_types = edge_types
+        self.node_dim = node_dim
         self.hidden_dim = hidden_dim
         
-        # Heterogeneous graph convolution layers
-        self.conv1 = HeteroConv({
-            edge_type: SAGEConv(-1, hidden_dim) 
-            for edge_type in edge_types
-        }, aggr='sum')
+        # GraphSAGE layers
+        self.conv1 = SAGEConv(node_dim, hidden_dim)
+        self.conv2 = SAGEConv(hidden_dim, hidden_dim)
+        self.conv3 = SAGEConv(hidden_dim, node_dim)
         
-        self.conv2 = HeteroConv({
-            edge_type: SAGEConv(hidden_dim, hidden_dim) 
-            for edge_type in edge_types  
-        }, aggr='sum')
+        self.activation = nn.ReLU()
         
-        # Output projections for each node type
-        self.output_projs = nn.ModuleDict({
-            node_type: Linear(hidden_dim, 2)  # 2D position derivatives
-            for node_type in node_dims.keys()
-        })
+    def forward(self, t: torch.Tensor, x: torch.Tensor, 
+                edge_index: torch.Tensor) -> torch.Tensor:
         
-    def forward(self, t, x_dict):
-        """
-        Args:
-            t: time (not used in autonomous system)
-            x_dict: Dict[str, Tensor] - node features by type
-        Returns:
-            dx_dict: Dict[str, Tensor] - derivatives by node type
-        """
-        # Apply graph convolutions
-        h_dict = self.conv1(x_dict, self.edge_index_dict)
-        h_dict = {key: F.relu(h) for key, h in h_dict.items()}
-        h_dict = self.conv2(h_dict, self.edge_index_dict)
+        h = self.conv1(x, edge_index)
+        h = self.activation(h)
         
-        # Compute derivatives for each node type
-        dx_dict = {}
-        for node_type, h in h_dict.items():
-            if node_type in self.output_projs:
-                dx_dict[node_type] = self.output_projs[node_type](h)
-                
-        return dx_dict
-    
-    def set_graph_structure(self, edge_index_dict):
-        """Set the current graph structure"""
-        self.edge_index_dict = edge_index_dict
+        h = self.conv2(h, edge_index)
+        h = self.activation(h)
+        
+        # Final layer (no activation for derivative)
+        dx_dt = self.conv3(h, edge_index)
+        
+        return dx_dt
 
-class WarehouseGraphODE(nn.Module):
-    """Complete Warehouse Graph ODE Model"""
+class GraphODE(nn.Module):
+    """Simple Graph Neural ODE for trajectory prediction"""
     
-    def __init__(self, 
-                 node_dims: Dict[str, int],
-                 edge_types: List[Tuple[str, str, str]],
-                 hidden_dim: int = 64,
-                 method: str = 'dopri5'):
+    def __init__(self, node_dim: int, num_agvs: int, num_pickers: int, hidden_dim: int = 64, ode_solver: str = 'euler'):
         super().__init__()
         
-        self.node_dims = node_dims
-        self.hidden_dim = hidden_dim
-        self.method = method
-        
-        # Feature encoders for each node type
-        self.encoders = nn.ModuleDict({
-            'agv': nn.Sequential(
-                Linear(7, hidden_dim),  # AGV features
-                nn.ReLU(),
-                Linear(hidden_dim, hidden_dim)
-            ),
-            'picker': nn.Sequential(
-                Linear(4, hidden_dim),  # Picker features  
-                nn.ReLU(),
-                Linear(hidden_dim, hidden_dim)
-            ),
-            'location': nn.Sequential(
-                Linear(2, hidden_dim),  # Location features
-                nn.ReLU(), 
-                Linear(hidden_dim, hidden_dim)
-            )
-        })
+        self.node_dim = node_dim
+        self.num_agvs = num_agvs
+        self.num_pickers = num_pickers
+        self.ode_solver = ode_solver
         
         # ODE function
-        self.ode_func = HeteroGraphODEFunc(node_dims, edge_types, hidden_dim)
+        self.ode_func = GraphODEFunc(
+            node_dim=node_dim,
+            hidden_dim=hidden_dim
+        )
         
-        # Position extractors (for positions from encoded features)
-        self.position_extractors = nn.ModuleDict({
-            'agv': Linear(hidden_dim, 2),
-            'picker': Linear(hidden_dim, 2)
-        })
+        # Simple position decoder
+        self.position_decoder = nn.Linear(node_dim, 2)
         
-    def forward(self, hetero_data: HeteroData, time_steps: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass through Graph ODE
-        
-        Args:
-            hetero_data: Heterogeneous graph data
-            time_steps: [T] time points to solve for
-            
-        Returns:
-            trajectories: Dict[str, Tensor] - predicted trajectories [T, N, 2]
-        """
-        # Set graph structure in ODE function
-        edge_index_dict = {}
-        for edge_type in hetero_data.edge_types:
-            edge_index_dict[edge_type] = hetero_data[edge_type].edge_index
-        self.ode_func.set_graph_structure(edge_index_dict)
-        
-        # Encode initial node features
-        # x0_dict = {}
-        # for node_type in hetero_data.node_types:
-        #     if node_type in self.encoders and hetero_data[node_type].num_nodes > 0:
-        #         x0_dict[node_type] = self.encoders[node_type](hetero_data[node_type].x)
-        x0 = []
-        for node_type in hetero_data.node_types:
-            if node_type in self.encoders and hetero_data[node_type].num_nodes > 0:
-                x0.append(self.encoders[node_type](hetero_data[node_type].x))
+    def forward(self, batch_data: Batch, time_span: torch.Tensor) -> Dict[str, torch.Tensor]:
 
-        x0 = torch.cat(x0, dim=0)
+        x0 = batch_data.x  # [total_nodes, node_dim]
+        edge_index = batch_data.edge_index
+        batch = batch_data.batch  # [total_nodes] batch indices
+
+        # Create ODE function with fixed graph structure
+        def ode_func_wrapper(t, x):
+            return self.ode_func(t, x, edge_index)
+        
         # Solve ODE
-        trajectory_dict = odeint(
-            self.ode_func, 
-            x0, # x0_dict,
-            time_steps,
-            method=self.method
-        )
+        solution = odeint(
+            ode_func_wrapper,
+            x0,
+            time_span,
+            method=self.ode_solver,
+            rtol=1e-3,
+            atol=1e-4
+        )  # [num_time_points, total_nodes, node_dim]
         
-        # Extract positions from trajectories
-        position_trajectories = {}
-        for node_type in ['agv', 'picker']:
-            if node_type in trajectory_dict:
-                # trajectory_dict[node_type]: [T, N, hidden_dim]
-                positions = self.position_extractors[node_type](trajectory_dict[node_type])
-                position_trajectories[node_type] = positions  # [T, N, 2]
-        
-        return position_trajectories
+        # Extract trajectories (positions) at all time points
+        trajectories = []
+        for t_idx in range(solution.size(0)):
+            node_features = solution[t_idx]  # [total_nodes, node_dim]
+            positions = self.position_decoder(node_features)  # [total_nodes, 2]
+            trajectories.append(positions)
 
-class WarehouseTrajectoryPredictor:
-    """Complete trajectory prediction system"""
+        trajectories = torch.stack(trajectories, dim=0)  # [num_time_points, total_nodes, 2]
+
+        return {
+            'trajectories': trajectories,
+            'node_features': solution,
+            'batch': batch
+        }
     
-    def __init__(self, h5_file_path: str, hidden_dim: int = 64):
-        self.data_loader = WarehouseDataLoader(h5_file_path)
-        self.hidden_dim = hidden_dim
-        self.model = None
-        
-    def initialize_model(self, sample_data: HeteroData):
-        """Initialize model based on data structure"""
-        # Extract node dimensions and edge types from sample data
-        node_dims = {}
-        for node_type in sample_data.node_types:
-            if sample_data[node_type].num_nodes > 0:
-                node_dims[node_type] = sample_data[node_type].x.shape[1]
-        
-        edge_types = list(sample_data.edge_types)
-        
-        self.model = WarehouseGraphODE(
-            node_dims=node_dims,
-            edge_types=edge_types, 
-            hidden_dim=self.hidden_dim
-        )
-        
-        return self.model
+    def predict_trajectory(self, batch_data: Batch, num_steps: int, dt: float = 0.1) -> torch.Tensor:
+
+        time_span = torch.arange(0, num_steps + 1, dtype=torch.float32)
+        result = self.forward(batch_data, time_span)
+        return result['trajectories']
     
-    def train_episode(self, episode_id: int, num_epochs: int = 100):
-        """Train on single episode"""
-        # Load episode data
-        episode_data = self.data_loader.load_episode_data(episode_id)
-        sequences = self.data_loader.create_trajectory_sequences(episode_data)
+class GraphConverter:
+    def __init__(self, num_agvs, num_pickers, distance_threshold: float = 3.0, temporal_window: int = 5):
+        self.num_agvs = num_agvs
+        self.num_pickers = num_pickers
+        self.distance_threshold = distance_threshold
+        self.temporal_window = temporal_window
+        self.graph_history = deque(maxlen=temporal_window)
+    
+    def _build_graph_from_observation(self, observations: np.ndarray) -> Data:
+
+        num_agents = len(observations)
         
-        if not sequences:
-            print("No sequences found!")
-            return
-            
-        # Initialize model if needed
-        if self.model is None:
-            self.initialize_model(sequences[0].hetero_data)
-            
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        # 1. Standardize observations with zero-padding
+        standardized_obs = self._standardize_observations(observations)
         
-        print(f"Training on {len(sequences)} sequences...")
+        # 2. Extract locations from observations based on agent types
+        locations = self._extract_locations_by_agent_type(standardized_obs)
         
-        for epoch in range(num_epochs):
-            total_loss = 0
+        # 3. Create node features
+        node_features = torch.tensor(standardized_obs, dtype=torch.float32)
+        
+        # 4. Compute spatial edges (bidirectional)
+        spatial_edges = self._compute_spatial_edges(locations)
+        
+        # 5. Compute temporal edges (unidirectional) with temporal window
+        temporal_edges = self._compute_temporal_edges_with_window(num_agents)
+        
+        # 6. Combine all edges
+        if temporal_edges.shape[1] > 0:
+            edge_index = torch.cat([spatial_edges, temporal_edges], dim=1)
+        else:
+            edge_index = spatial_edges
+        
+        # 7. Create graph with timestep-based node indexing
+        current_timestep = len(self.graph_history)
+        node_timestep_offset = current_timestep * num_agents
+        
+        # Adjust node indices to be globally unique across timesteps
+        global_node_features = node_features
+        if len(self.graph_history) > 0:
+            # Concatenate with previous timesteps' node features
+            prev_features = []
+            for prev_graph in self.graph_history:
+                prev_features.append(prev_graph.x)
+            global_node_features = torch.cat(prev_features + [node_features], dim=0)
+        
+        # Adjust edge indices for global indexing
+        adjusted_edge_index = edge_index.clone()
+        adjusted_edge_index += node_timestep_offset
+        
+        # Combine with previous temporal edges
+        if len(self.graph_history) > 0:
+            prev_edges = []
+            for i, prev_graph in enumerate(self.graph_history):
+                prev_edge_index = prev_graph.edge_index.clone()
+                prev_edges.append(prev_edge_index)
             
-            for seq_batch in sequences:
-                optimizer.zero_grad()
+            if len(prev_edges) > 0:
+                all_prev_edges = torch.cat(prev_edges, dim=1)
+                adjusted_edge_index = torch.cat([all_prev_edges, adjusted_edge_index], dim=1)
+        
+        # 8. Create current timestep graph
+        current_graph = Data(x=node_features, edge_index=edge_index)
+        
+        # 9. Create global graph
+        global_graph = Data(x=global_node_features, edge_index=adjusted_edge_index)
+        
+        # 10. Store current graph in history
+        self.graph_history.append(current_graph)
+        
+        return global_graph
+    
+    def _extract_locations_by_agent_type(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Extract (y, x) locations from observations based on agent types
+        
+        AGV observation: [picker_info(7)] + [other_agvs_info] + [other_pickers_info] + [shelf_info]
+        - picker_info: [carrying_shelf, in_request_queue, req_action, y, x, target_y, target_x]
+        
+        Picker observation: [picker_info(4)] + [other_pickers_info] + [agvs_info]  
+        - picker_info: [y, x, target_y, target_x]
+        """
+        locations = []
+        
+        for i, obs in enumerate(observations):
+            if i < self.num_agvs:  # AGV agent
+                # AGV의 경우: 자신의 picker 정보에서 위치 추출 (인덱스 3, 4)
+                y, x = obs[3], obs[4]
+            else:  # Picker agent
+                # Picker의 경우: 관찰의 시작 부분에서 위치 추출 (인덱스 0, 1)
+                y, x = obs[0], obs[1]
+            
+            locations.append([y, x])
+        
+        return np.array(locations)
+    
+    def _standardize_observations(self, observations: np.ndarray) -> np.ndarray:
+        """Standardize observation sizes with zero-padding"""
+        if isinstance(observations, np.ndarray) and observations.dtype == object:
+            obs_list = observations.tolist()
+        elif isinstance(observations, list):
+            obs_list = observations
+        else:
+            return observations
+        
+        max_obs_length = max(len(obs) for obs in obs_list)
+        standardized_obs = np.zeros((len(obs_list), max_obs_length), dtype=np.float32)
+        
+        for i, obs in enumerate(obs_list):
+            obs_array = np.array(obs, dtype=np.float32)
+            standardized_obs[i, :len(obs_array)] = obs_array
+        
+        return standardized_obs
+    
+    def _compute_spatial_edges(self, locations: np.ndarray) -> torch.Tensor:
+        """Compute spatial edges based on distance threshold"""
+        num_agents = locations.shape[0]
+        edges = []
+        
+        for i in range(num_agents):
+            for j in range(i + 1, num_agents):
+                distance = np.sqrt(np.sum((locations[i] - locations[j]) ** 2))
                 
-                # Predict trajectories
-                pred_trajectories = self.model(
-                    seq_batch.hetero_data,
-                    seq_batch.time_steps
-                )
+                if distance < self.distance_threshold:
+                    edges.append([i, j])
+                    edges.append([j, i])
+        
+        if len(edges) == 0:
+            return torch.empty((2, 0), dtype=torch.long)
+        
+        return torch.tensor(edges, dtype=torch.long).t()
+    
+    def _compute_temporal_edges_with_window(self, num_agents: int) -> torch.Tensor:
+        """Compute temporal edges within the temporal window"""
+        edges = []
+        current_timestep = len(self.graph_history)
+        
+        if current_timestep > 0:
+            prev_timestep_offset = (current_timestep - 1) * num_agents
+            current_timestep_offset = current_timestep * num_agents
+            
+            for agent_idx in range(num_agents):
+                prev_node_idx = prev_timestep_offset + agent_idx
+                current_node_idx = current_timestep_offset + agent_idx
+                edges.append([prev_node_idx, current_node_idx])
+        
+        if len(edges) == 0:
+            return torch.empty((2, 0), dtype=torch.long)
+        
+        return torch.tensor(edges, dtype=torch.long).t()
+    
+    def reset_history(self):
+        """Reset the graph history (useful for new episodes)"""
+        self.graph_history.clear()
+
+class TrajectoryBatch:
+    graphs: Batch           # 현재 상태 그래프
+    next_positions: torch.Tensor  # [total_nodes, 2] 다음 스텝 위치
+
+class WarehouseDataset(Dataset):
+    def __init__(self, h5_file_path: str):
+        self.h5_file_path = h5_file_path
+
+        with h5py.File(h5_file_path, 'r') as f:
+            episode_ids = [int(key.split('_')[1]) for key in f.keys() if key.startswith('episode_')]
+        self.episode_ids = sorted(episode_ids)
+
+        self.sequences = []
+        self.node_dim = None
+        self.num_agvs = None
+        self.num_pickers = None
+
+        self._load_all_sequences()
+
+    def _load_all_sequences(self):
+        with h5py.File(self.h5_file_path, 'r') as f:
+            episode_ids = [int(key.split('_')[1]) for key in f.keys() if key.startswith('episode_')]
+            self.episode_ids = sorted(episode_ids)
+            
+            for episode_id in self.episode_ids:
+                episode_group = f[f'episode_{episode_id:06d}']
+                steps_group = episode_group['steps']
+                num_agvs = episode_group['metadata'].attrs['num_agvs']
+                num_pickers = episode_group['metadata'].attrs['num_pickers']
                 
-                # Compute loss (MSE on positions)
-                loss = 0
-                for node_type in pred_trajectories:
-                    if node_type in seq_batch.trajectories:
-                        pred = pred_trajectories[node_type]  # [T, N, 2]
-                        target = seq_batch.trajectories[node_type]  # [T, N, 2]
+                if self.num_agvs is None:
+                    self.num_agvs = num_agvs
+                    self.num_pickers = num_pickers
+                    
+                converter = GraphConverter(num_agvs, num_pickers, distance_threshold=5.0, temporal_window=5)
+                step_data = []
+                
+                for step_name in sorted(steps_group.keys()):
+                    step_group = steps_group[step_name]
+                    observations = step_group['observations'][:]
+                    graph_data = converter._build_graph_from_observation(observations)
+                    
+                    if self.node_dim is None:
+                        self.node_dim = graph_data.x.size(1)
                         
-                        # Only predict future steps
-                        pred_future = pred[self.data_loader.sequence_length:]
-                        target_future = target[self.data_loader.sequence_length:]
-                        
-                        loss += F.mse_loss(pred_future, target_future)
+                    positions = self._extract_positions_from_observations(observations, num_agvs, num_pickers)
+                    step_data.append({
+                        'graph': graph_data,
+                        'positions': positions,
+                    })
                 
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                
-            if epoch % 10 == 0:
-                avg_loss = total_loss / len(sequences)
-                print(f"Epoch {epoch}: Loss = {avg_loss:.6f}")
+                # (현재 그래프, 다음 위치) 페어 생성
+                for i in range(len(step_data) - 1):  # 마지막 스텝은 다음이 없으니 제외
+                    current_graph = step_data[i]['graph']
+                    next_positions = step_data[i + 1]['positions']
+                    
+                    self.sequences.append(TrajectoryBatch(
+                        graphs=current_graph,
+                        next_positions=next_positions
+                    ))
+                    
+        print(f"Loaded {len(self.sequences)} step pairs from {self.h5_file_path}")
+        print(f"Node dimension: {self.node_dim}")
+        print(f"Agents: {self.num_agvs} AGVs, {self.num_pickers} Pickers")
     
-    def predict_trajectory(self, hetero_data: HeteroData, num_steps: int = 10) -> Dict[str, torch.Tensor]:
-        """Predict future trajectories"""
-        if self.model is None:
-            raise ValueError("Model not initialized! Train first.")
+    def _extract_positions_from_graph(self, graph: Data, num_agvs: int, num_pickers: int) -> torch.Tensor:
+        """Extract position information from graph"""
+        positions = []
+        
+        # AGV positions (indices 3, 4 in standardized obs -> y, x -> x, y)
+        if num_agvs > 0:
+            agv_features = graph.x[:num_agvs]
+            agv_pos = agv_features[:, [4, 3]]  # [x, y]
+            positions.append(agv_pos)
+        
+        # Picker positions (indices 0, 1 in standardized obs -> y, x -> x, y)  
+        if num_pickers > 0:
+            picker_features = graph.x[num_agvs:num_agvs + num_pickers]
+            picker_pos = picker_features[:, [1, 0]]  # [x, y]
+            positions.append(picker_pos)
+        
+        # Concatenate all positions
+        all_positions = torch.cat(positions, dim=0)  # [total_agents, 2]
+        
+        return all_positions
+    
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx]
+
+def collate_trajectory_batches(batch_list: List[TrajectoryBatch]) -> TrajectoryBatch:
+    """Collate function for DataLoader"""
+    # Batch graphs
+    graphs = [item.graphs for item in batch_list]
+    batched_graph = Batch.from_data_list(graphs)
+    
+    # Stack next positions
+    next_positions = torch.stack([item.next_positions for item in batch_list], dim=0)  # [B, N, 2]
+    
+    return TrajectoryBatch(
+        graphs=batched_graph,
+        next_positions=next_positions
+    )
+
+def train_graph_ode(model: GraphODE, train_loader: DataLoader, val_loader: DataLoader = None,
+                   num_epochs: int = 100, lr: float = 1e-3, device: str = 'cpu'):
+    """Training loop with proper batching"""
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        total_train_loss = 0
+        num_train_batches = 0
+        
+        for batch in train_loader:
+            batch = batch.to_device(device)
             
-        time_steps = torch.linspace(0, 1, num_steps)
-        
-        with torch.no_grad():
-            trajectories = self.model(hetero_data, time_steps)
+            # Zero gradients
+            optimizer.zero_grad()
             
-        return trajectories
-    
-    def visualize_predictions(self, hetero_data: HeteroData, trajectories: Dict[str, torch.Tensor]):
-        """Visualize predicted trajectories"""
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-        
-        # Plot AGV trajectories
-        if 'agv' in trajectories:
-            agv_traj = trajectories['agv'].numpy()  # [T, N, 2]
-            for agent_idx in range(agv_traj.shape[1]):
-                ax.plot(agv_traj[:, agent_idx, 0], agv_traj[:, agent_idx, 1], 
-                       'b-', alpha=0.7, label=f'AGV {agent_idx}' if agent_idx == 0 else '')
-                ax.scatter(agv_traj[0, agent_idx, 0], agv_traj[0, agent_idx, 1], 
-                          c='blue', s=100, marker='s')
-                ax.scatter(agv_traj[-1, agent_idx, 0], agv_traj[-1, agent_idx, 1], 
-                          c='blue', s=100, marker='*')
-        
-        # Plot Picker trajectories  
-        if 'picker' in trajectories:
-            picker_traj = trajectories['picker'].numpy()  # [T, N, 2]
-            for agent_idx in range(picker_traj.shape[1]):
-                ax.plot(picker_traj[:, agent_idx, 0], picker_traj[:, agent_idx, 1], 
-                       'r-', alpha=0.7, label=f'Picker {agent_idx}' if agent_idx == 0 else '')
-                ax.scatter(picker_traj[0, agent_idx, 0], picker_traj[0, agent_idx, 1], 
-                          c='red', s=100, marker='s')
-                ax.scatter(picker_traj[-1, agent_idx, 0], picker_traj[-1, agent_idx, 1], 
-                          c='red', s=100, marker='*')
-        
-        ax.set_xlabel('X Position')
-        ax.set_ylabel('Y Position') 
-        ax.set_title('Warehouse Agent Trajectory Predictions')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.show()
-
-# class MultiAgentGraphConverter:
-#     def __init__(self, num_agvs, num_pickers, topk_tasks=5, max_comm_distance=5.0, max_task_distance=10.0):
-
-#         # Parameters for the graph observation space
-#         self.topk_tasks = topk_tasks
-#         self.max_comm_distance = max_comm_distance
-#         self.max_task_distance = max_task_distance
-
-#         # Node counts
-#         self.num_agv_nodes = num_agvs
-#         self.num_picker_nodes = num_pickers
-#         self.num_location_nodes = None
-
-#         # Node feature dimensions
-#         self.agv_feature_dim = 7 # [carrying_shelf, carrying_requested, toggle_loading, pos_y, pos_x, target_y, target_x]
-#         self.picker_feature_dim = 4 # [pos_y, pos_x, target_y, target_x]
-#         self.location_feature_dim = 2 # [has_shelf, is_requested]
-
-#         # Store extracted info from environment
-#         self._current_agents_info = []
-#         self._current_shelves_info = []
-#         self._rack_locations = []
-
-#         # Graph components
-#         self.node_features = None
-#         self.edge_index = None
-#         self.edge_features = None
-#         self.node_types = None
-
-#         self.position_to_sections = {}
-
-#     def _build_graph_from_observation(self, observation, rack_locations):
-#         self.num_location_nodes = len(rack_locations)
-#         self._rack_locations = []
-#         self._rack_locations = rack_locations
-#         agv_features = []
-#         picker_features = []
-#         location_features = []
-#         self.position_to_sections = {}
-#         # Reset agent and shelf info for this step
-#         self._current_agents_info = []
-#         self._current_shelves_info = []
-        
-#         # Extract node features from current_agents_info
-#         agv_count= 0
-#         picker_count = 0
-
-#         for agent_id, obs in enumerate(observation):
-#             if agent_id < self.num_agv_nodes:
-#                 agv_feature = obs[:self.agv_feature_dim]
-#                 self._current_agents_info.append(agv_feature)
-#                 agv_features.append(agv_feature)
-#                 agv_count += 1
-#             else:
-#                 picker_feature = obs[:self.picker_feature_dim]
-#                 self._current_agents_info.append(picker_feature)
-#                 picker_features.append(picker_feature)
-#                 picker_count += 1
-        
-#         # Extract task features from current_shelves_info
-#         shelf_data = observation[0][7+4*(self.num_agv_nodes+self.num_picker_nodes-1):]  # Start after AGV features
-#         for i in range(0, len(shelf_data), 2):
-#             location_features.append([shelf_data[i], shelf_data[i+1]])
-#             self._current_shelves_info.extend([shelf_data[i], shelf_data[i+1]])  # has_shelf, is_requested
-        
-#         # build edges dynamically based on the environment
-#         self.edge_list = self._build_edges() #  edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges]
-
-#         for (x, y, group_idx) in self._rack_locations:
-#                 self.position_to_sections[(x, y)] = group_idx
-
-#         data = HeteroData()
-#         if agv_features:
-#             data['agv'].num_nodes = self.num_agv_nodes
-#             data['agv'].x = torch.tensor(agv_features, dtype=torch.float32)
-#         else:
-#             data['agv'].num_nodes = 0
-#             data['agv'].x = torch.empty((0, self.agv_feature_dim), dtype=torch.float32)
-        
-#         if picker_features:
-#             data['picker'].num_nodes = self.num_picker_nodes
-#             data['picker'].x = torch.tensor(picker_features, dtype=torch.float32)
-#         else:
-#             data['picker'].num_nodes = 0
-#             data['picker'].x = torch.empty((0, self.picker_feature_dim), dtype=torch.float32)
-
-#         if location_features:
-#             data['location'].num_nodes = self.num_location_nodes
-#             data['location'].x = torch.tensor(location_features, dtype=torch.float32)
-#         else:
-#             data['location'].num_nodes = 0
-#             data['location'].x = torch.empty((0, self.location_feature_dim), dtype=torch.float32)
-        
-#         if self.edge_list[0]:  # agv2location_edges
-#             data['agv', 'targets', 'location'].edge_index = torch.tensor(self.edge_list[0], dtype=torch.long).t().contiguous()
-#         else:
-#             data['agv', 'targets', 'location'].edge_index = torch.empty((2, 0), dtype=torch.long)
-#         if self.edge_list[1]:  # location2agv_edges
-#             data['location', 'is targeted by', 'agv'].edge_index = torch.tensor(self.edge_list[1], dtype=torch.long).t().contiguous()
-#         else:
-#             data['location', 'is targeted by', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
-#         if self.edge_list[2]:  # agv2agv_edges
-#             data['agv', 'communicates', 'agv'].edge_index = torch.tensor(self.edge_list[2], dtype=torch.long).t().contiguous()
-#         else:
-#             data['agv', 'communicates', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
-#         if self.edge_list[3]:  # picker2location_edges
-#             data['picker', 'manages', 'location'].edge_index = torch.tensor(self.edge_list[3], dtype=torch.long).t().contiguous()
-#         else:
-#             data['picker', 'manages', 'location'].edge_index = torch.empty((2, 0), dtype=torch.long)
-#         if self.edge_list[4]:  # agv2picker_edges
-#             data['agv', 'cooperates with', 'picker'].edge_index = torch.tensor(self.edge_list[4], dtype=torch.long).t().contiguous()
-#         else:
-#             data['agv', 'cooperates with', 'picker'].edge_index = torch.empty((2, 0), dtype=torch.long)
-#         if self.edge_list[5]:  # picker2agv_edges
-#             data['picker', 'helps', 'agv'].edge_index = torch.tensor(self.edge_list[5], dtype=torch.long).t().contiguous()
-#         else:
-#             data['picker', 'helps', 'agv'].edge_index = torch.empty((2, 0), dtype=torch.long)
-
-#         return data
-    
-#     def _build_edges(self):
-#         # AGV-to-Task Edges
-#         agv2location_edges, location2agv_edges = self._build_agv_to_location_edges()
-#         # AGV-to-AGV Edges  
-#         agv2agv_edges = self._build_agv_to_agv_edges()
-#         # Picker-to-Task Edges
-#         picker2location_edges = self._build_picker_to_location_edges()
-#         # AGV-to-Picker Edges
-#         agv2picker_edges, picker2agv_edges = self._build_agv_to_picker_edges()
-        
-#         edge_list = [agv2location_edges, location2agv_edges, agv2agv_edges, picker2location_edges, agv2picker_edges, picker2agv_edges]
-#         return edge_list       
-
-#     def _build_agv_to_location_edges(self):
-#         agv2location_edges = []
-#         location2agv_edges = []
-#         for agv_idx in range(self.num_agv_nodes):
-#             agent_info = self._current_agents_info[agv_idx]
-
-#             agv_target = np.array([agent_info[5], agent_info[6]]) # target_y, target_x
-#             has_target = not (agv_target[0] ==0 and agv_target[1] == 0)
-
-#             if has_target:
-#                 for loc_idx, rack_pos in enumerate(self._rack_locations):
-#                     if rack_pos[0]  == agv_target[1] and rack_pos[1] == agv_target[0]:
-#                         agv2location_edges.extend([(agv_idx, loc_idx)])
-#                         location2agv_edges.extend([(loc_idx, agv_idx)])
-#                         break
-#             else:
-#                 for location_idx, _ in enumerate(self._rack_locations):
-#                     location_info = self._current_shelves_info[location_idx * 2: (location_idx + 1) * 2]
-#                     has_shelf = location_info[0]
-#                     is_requested = location_info[1]
-#                     if has_shelf and is_requested:
-#                         agv2location_edges.extend([(agv_idx, location_idx)])
-#                         location2agv_edges.extend([(location_idx, agv_idx)])
-
-#         return agv2location_edges, location2agv_edges
-    
-#     def _build_agv_to_agv_edges(self):
-#         """ Build AGV-to-AGV edges : distance  """
-#         agv2agv_edges = []
-#         for i in range(self.num_agv_nodes):
-#             for j in range(i+1, self.num_agv_nodes):
-#                 agent_i_info = self._current_agents_info[i]
-#                 agent_j_info = self._current_agents_info[j]
-
-#                 pos_i = np.array([agent_i_info[4], agent_i_info[3]]) # pos_x, pos_y
-#                 pos_j = np.array([agent_j_info[4], agent_j_info[3]]) # pos_x, pos_y
-
-#                 target_i = np.array([agent_i_info[6], agent_i_info[5]]) # target_x, target_y
-#                 target_j = np.array([agent_j_info[6], agent_j_info[5]]) # target_x, target_y
-
-#                 dist = np.linalg.norm(pos_i - pos_j, ord=1)
-
-#                 has_target_i = not (target_i[0] == 0 and target_i[1] == 0)
-#                 has_target_j = not (target_j[0] == 0 and target_j[1] == 0)
-#                 same_section = False
-#                 if has_target_i and has_target_j:
-#                     same_section = self._check_same_rack_group(target_i, target_j)
-
-#                 if i != j and (dist <= self.max_comm_distance or same_section):
-#                     agv2agv_edges.extend([(i, j), (j, i)])
-
-#         return agv2agv_edges
-
-#     def _build_picker_to_location_edges(self):
-#         """Build Picker-Task edges: zone-based + assigned tasks"""
-#         picker2location_edges = []
-#         for picker_idx in range(self.num_picker_nodes):
-#             agent_info = self._current_agents_info[self.num_agv_nodes + picker_idx]
+            # Forward pass
+            result = model(batch.graph_data, batch.time_steps)
+            pred_trajectories = result['trajectories']  # [T, total_nodes, 2]
             
-#             # Get picker position and target
-#             picker_pos = np.array([agent_info[1], agent_info[0]])  # pos_x, pos_y
-#             picker_target = np.array([agent_info[3], agent_info[2]])  # target_x, target_y
-#             has_target = not (picker_target[0] == 0 and picker_target[1] == 0)
+            # Reshape target trajectories to match prediction
+            # batch.trajectories: [B, T, N, 2] -> need to flatten to [T, B*N, 2]
+            B, T, N, _ = batch.trajectories.shape
+            target_trajectories = batch.trajectories.permute(1, 0, 2, 3).reshape(T, B * N, 2)
             
-#             picker_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
-
-#             for loc_idx, rack_pos in enumerate(self._rack_locations): # rack_pos is (x, y) format
-#                 shelf_info = self._current_shelves_info[loc_idx * 2: (loc_idx + 1) * 2]
-#                 loc_section = self.position_to_sections.get((rack_pos[0], rack_pos[1]), None)
-#                 has_shelf = shelf_info[0]
-#                 is_requested = shelf_info[1]
-
-#                 if has_target and (rack_pos == picker_target):
-#                     picker2location_edges.append((picker_idx, loc_idx))
-#                 elif not has_target and picker_section == loc_section and (has_shelf and is_requested):
-#                     picker2location_edges.append((picker_idx, loc_idx))
+            # Compute loss
+            loss = F.mse_loss(pred_trajectories, target_trajectories)
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_train_loss += loss.item()
+            num_train_batches += 1
         
-#         return picker2location_edges
-    
-#     def _build_agv_to_picker_edges(self):
-#         """Build AGV-Picker edges: cooperation based"""
-#         agv2picker_edges = []
-#         picker2agv_edges = []
-
-#         for agv_idx in range(self.num_agv_nodes):
-#             for picker_idx in range(self.num_picker_nodes):
-#                 agv_info = self._current_agents_info[agv_idx]
-#                 picker_info = self._current_agents_info[self.num_agv_nodes + picker_idx]
-                
-#                 # Get positions and targets
-#                 agv_pos = np.array([agv_info[4], agv_info[3]]) # pos_x, pos_y
-#                 picker_pos = np.array([picker_info[1], picker_info[0]]) # pos_x, pos_y
-#                 agv_target = np.array([agv_info[6], agv_info[5]]) # target_x, target_y
-#                 picker_target = np.array([picker_info[3], picker_info[2]]) # target_x, target_y
-                
-#                 # Check cooperation conditions
-                
-#                 # Condition 1: Spatial proximity
-#                 dist = np.linalg.norm(agv_pos - picker_pos, ord=1)
-#                 close_proximity = dist <= self.max_comm_distance
-
-#                 # Condition 2: Same target section coordination
-#                 has_picker_taget = not (picker_target[0] == 0 and picker_target[1] == 0)
-#                 has_agv_target = not (agv_target[0] == 0 and agv_target[1] == 0)
-#                 same_target = False
-#                 same_target_section = False
-#                 agv_target_in_picker_section = False
-#                 if has_agv_target and has_picker_taget:
-#                     same_target = picker_target[0] == agv_target[0] and picker_target[1] == agv_target[1]
-#                     if not same_target:
-#                         agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
-#                         picker_target_section = self.position_to_sections.get((picker_target[0], picker_target[1]), None)
-#                         if agv_target_section is not None and picker_target_section is not None:
-#                             same_target_section = agv_target_section == picker_target_section
-
-#                 else:
-#                     picker_current_section = self.position_to_sections.get((picker_pos[0], picker_pos[1]), None)
-#                     if has_agv_target:
-#                         agv_target_section = self.position_to_sections.get((agv_target[0], agv_target[1]), None)
-#                         agv_target_in_picker_section = picker_current_section == agv_target_section
-                
-#                 if close_proximity or same_target or same_target_section or agv_target_in_picker_section:
-#                     agv2picker_edges.append((agv_idx, picker_idx))
-#                     picker2agv_edges.append((picker_idx, agv_idx))
+        avg_train_loss = total_train_loss / num_train_batches
         
-#         return agv2picker_edges, picker2agv_edges
-    
-#     def _check_same_rack_group(self, pos_i, pos_j):
-#         group_i = self.position_to_sections.get((pos_i[0], pos_i[1]), None)
-#         group_j = self.position_to_sections.get((pos_j[0], pos_j[1]), None)
-#         return (group_i is not None and group_j is not None and group_i == group_j)
-
-
+        # Validation
+        val_loss = 0
+        if val_loader is not None:
+            model.eval()
+            with torch.no_grad():
+                total_val_loss = 0
+                num_val_batches = 0
+                
+                for batch in val_loader:
+                    batch = batch.to_device(device)
+                    result = model(batch.graph_data, batch.time_steps)
+                    pred_trajectories = result['trajectories']
+                    
+                    B, T, N, _ = batch.trajectories.shape
+                    target_trajectories = batch.trajectories.permute(1, 0, 2, 3).reshape(T, B * N, 2)
+                    
+                    loss = F.mse_loss(pred_trajectories, target_trajectories)
+                    total_val_loss += loss.item()
+                    num_val_batches += 1
+                
+                val_loss = total_val_loss / num_val_batches
+        
+        print(f"Epoch {epoch:3d} | Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
 def check_h5_structure(file_path):
     with h5py.File(file_path, 'r') as f:
@@ -737,29 +486,80 @@ if __name__ == "__main__":
     #     'tarware-medium-19agvs-9pickers-partialobs-v1',
     #     'tarware-large-15agvs-8pickers-partialobs-v1'
     # ]
-    h5_file_path = "./warehouse_data_tarware-tiny-3agvs-2pickers-partialobs-v1_seed0.h5"
-    predictor = WarehouseTrajectoryPredictor(h5_file_path, hidden_dim=64)
+    parameters = {
+        'num_epochs': 50,
+        'batch_size': 32,
+        'lr': 1e-4,
+        'weight_decay': 1e-5,
+        }
+    seed = [0, 2000, 4000, 6000, 8000]
+    env = 'tarware-tiny-3agvs-2pickers-partialobs-v1'
+    file_path = [f'./warehouse_data_{env}_seed{s}.h5' for s in seed]
+    dataset = ConcatDataset([WarehouseDataset(fp, episode_ids=list(range(10))) for fp in file_path])
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.2 * len(dataset))
+    train_dataset, val_dataset= torch.utils.data.random_split(dataset, [train_size, val_size])
+    print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    train_loader = DataLoader(train_dataset, batch_size=parameters['batch_size'], shuffle=True, collate_fn=collate_trajectory_batches)
+    val_loader = DataLoader(val_dataset, batch_size=parameters['batch_size'], shuffle=False, collate_fn=collate_trajectory_batches)
     
-    # Train on first episode
-    print("Training Graph ODE model...")
-    for episode_id in range(200):
-        print(f"Training on episode {episode_id}...")
-        predictor.train_episode(episode_id=0, num_epochs=100)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = GraphODE(node_dim = dataset.node_dim, num_agvs=dataset.num_agvs, num_pickers=dataset.num_pickers, hidden_dim=64, ode_solver='euler')
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=parameters['lr'], weight_decay=parameters['weight_decay'])
     
-    # Load test data
-    test_episode_data = predictor.data_loader.load_episode_data(episode_id=1)
-    if test_episode_data:
-        test_graph = test_episode_data[10]['graph']  # Use step 10 as initial condition
+    for epoch in range(parameters['num_epochs']):
+        # Training
+        model.train()
+        total_train_loss = 0
+        num_train_batches = 0
         
-        # Predict future trajectories
-        print("Predicting trajectories...")
-        predicted_trajectories = predictor.predict_trajectory(test_graph, num_steps=15)
+        for batch in train_loader:
+            batch.graphs = batch.graphs.to(device)
+            batch_next_positions = batch.next_positions.to(device)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            time_span = torch.tensor([0., 1.], device=device)  # 한 스텝 (t=0 -> t=1)
+            result = model(batch.graphs, time_span)
+            pred_trajectories = result['trajectories']  # [2, total_nodes, 2] (t=0, t=1)
+            pred_next_positions = pred_trajectories[1]  # [total_nodes, 2] (t=1만 사용)
+            
+            # Compute loss: 예측 vs 실제 다음 위치
+            loss = F.mse_loss(pred_next_positions, batch.next_positions.view(-1, 2))
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_train_loss += loss.item()
+            num_train_batches += 1
         
-        # Visualize
-        # print("Visualizing predictions...")
-        # predictor.visualize_predictions(test_graph, predicted_trajectories)
+        avg_train_loss = total_train_loss / num_train_batches
         
-        # Print trajectory statistics
-        for node_type, traj in predicted_trajectories.items():
-            print(f"{node_type} trajectory shape: {traj.shape}")
-            print(f"{node_type} position range: x[{traj[:,:,0].min():.2f}, {traj[:,:,0].max():.2f}], y[{traj[:,:,1].min():.2f}, {traj[:,:,1].max():.2f}]")
+        # Validation
+        val_loss = 0
+        if val_loader is not None:
+            model.eval()
+            with torch.no_grad():
+                total_val_loss = 0
+                num_val_batches = 0
+                
+                for batch in val_loader:
+                    batch.graphs = batch.graphs.to(device)
+                    batch.next_positions = batch.next_positions.to(device)
+                    
+                    time_span = torch.tensor([0., 1.], device=device)
+                    result = model(batch.graphs, time_span)
+                    pred_next_positions = result['trajectories'][1]
+                    
+                    loss = F.mse_loss(pred_next_positions, batch.next_positions.view(-1, 2))
+                    total_val_loss += loss.item()
+                    num_val_batches += 1
+                
+                val_loss = total_val_loss / num_val_batches
+            
+        print(f"Epoch {epoch:3d} | Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss:.6f}")
