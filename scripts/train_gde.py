@@ -110,7 +110,6 @@ class GraphConverter:
         self.graph_history = deque(maxlen=temporal_window)
     
     def _build_graph_from_observation(self, observations: np.ndarray) -> Data:
-
         num_agents = len(observations)
         
         # 1. Standardize observations with zero-padding
@@ -122,54 +121,52 @@ class GraphConverter:
         # 3. Create node features
         node_features = torch.tensor(standardized_obs, dtype=torch.float32)
         
-        # 4. Compute spatial edges (bidirectional)
+        # 4. Compute spatial edges (bidirectional) - local 인덱스
         spatial_edges = self._compute_spatial_edges(locations)
         
-        # 5. Compute temporal edges (unidirectional) with temporal window
-        temporal_edges = self._compute_temporal_edges_with_window(num_agents)
-        
-        # 6. Combine all edges
-        if temporal_edges.shape[1] > 0:
-            edge_index = torch.cat([spatial_edges, temporal_edges], dim=1)
-        else:
-            edge_index = spatial_edges
-        
-        # 7. Create graph with timestep-based node indexing
-        current_timestep = len(self.graph_history)
-        node_timestep_offset = current_timestep * num_agents
-        
-        # Adjust node indices to be globally unique across timesteps
-        global_node_features = node_features
-        if len(self.graph_history) > 0:
-            # Concatenate with previous timesteps' node features
-            prev_features = []
-            for prev_graph in self.graph_history:
-                prev_features.append(prev_graph.x)
-            global_node_features = torch.cat(prev_features + [node_features], dim=0)
-        
-        # Adjust edge indices for global indexing
-        adjusted_edge_index = edge_index.clone()
-        adjusted_edge_index += node_timestep_offset
-        
-        # Combine with previous temporal edges
-        if len(self.graph_history) > 0:
-            prev_edges = []
-            for i, prev_graph in enumerate(self.graph_history):
-                prev_edge_index = prev_graph.edge_index.clone()
-                prev_edges.append(prev_edge_index)
-            
-            if len(prev_edges) > 0:
-                all_prev_edges = torch.cat(prev_edges, dim=1)
-                adjusted_edge_index = torch.cat([all_prev_edges, adjusted_edge_index], dim=1)
-        
-        # 8. Create current timestep graph
-        current_graph = Data(x=node_features, edge_index=edge_index)
-        
-        # 9. Create global graph
-        global_graph = Data(x=global_node_features, edge_index=adjusted_edge_index)
-        
-        # 10. Store current graph in history
+        # 5. Create and store current graph FIRST
+        current_graph = Data(x=node_features, edge_index=spatial_edges)
         self.graph_history.append(current_graph)
+        
+        # 6. Now calculate global indexing
+        current_position_in_window = len(self.graph_history) - 1  # 0, 1, 2, 3, 4, then 4, 4, 4...
+        current_timestep_offset = current_position_in_window * num_agents
+        
+        # 7. Build global node features
+        global_node_features = []
+        for prev_graph in self.graph_history:
+            global_node_features.append(prev_graph.x)
+        global_node_features = torch.cat(global_node_features, dim=0)
+        
+        # 8. Build global edge index
+        all_edges = []
+        
+        # 8a. Add all previous spatial edges (이미 저장된 것들은 global 인덱스로 변환)
+        for i, prev_graph in enumerate(self.graph_history[:-1]):  # 현재 제외
+            prev_spatial_edges = prev_graph.edge_index.clone()
+            prev_timestep_offset = i * num_agents
+            prev_spatial_edges += prev_timestep_offset
+            all_edges.append(prev_spatial_edges)
+        
+        # 8b. Add current spatial edges (global 인덱스로 변환)
+        if spatial_edges.shape[1] > 0:
+            current_spatial_edges = spatial_edges.clone()
+            current_spatial_edges += current_timestep_offset
+            all_edges.append(current_spatial_edges)
+        
+        # 8c. Add temporal edges (이미 global 인덱스)
+        temporal_edges = self._compute_temporal_edges_with_window(num_agents)
+        if temporal_edges.shape[1] > 0:
+            all_edges.append(temporal_edges)
+        
+        # 9. Combine all edges
+        if len(all_edges) > 0:
+            global_edge_index = torch.cat(all_edges, dim=1)
+        else:
+            global_edge_index = torch.empty((2, 0), dtype=torch.long)
+        
+        # 10. Create global graph
+        global_graph = Data(x=global_node_features, edge_index=global_edge_index)
         
         return global_graph
     
