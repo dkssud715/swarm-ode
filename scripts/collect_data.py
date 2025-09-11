@@ -68,11 +68,64 @@ class HDF5Logger:
         # 현재 observation도 저장 (그래프 변환용)
         try:
             current_obs = [env.observation_space_mapper.observation(agent) for agent in env.agents]
-            step_data['observations'] = np.array(current_obs)
-        except:
-            # observation이 없는 경우 패스
-            pass
             
+            # 🔥 Zero padding으로 모든 observation을 같은 shape으로 맞추기
+            if len(current_obs) > 0:
+                # 모든 observation을 numpy array로 변환
+                obs_arrays = []
+                for obs in current_obs:
+                    if isinstance(obs, (list, tuple)):
+                        obs_arrays.append(np.array(obs))
+                    elif isinstance(obs, np.ndarray):
+                        obs_arrays.append(obs)
+                    else:
+                        # 다른 타입인 경우 array로 변환 시도
+                        obs_arrays.append(np.array([obs]))
+                
+                # 최대 차원 수 찾기
+                max_ndim = max(arr.ndim for arr in obs_arrays)
+                
+                # 각 차원별 최대 크기 찾기
+                max_shape = []
+                for dim in range(max_ndim):
+                    max_size = 0
+                    for arr in obs_arrays:
+                        if dim < arr.ndim:
+                            max_size = max(max_size, arr.shape[dim])
+                        # 차원이 부족한 경우는 크기 1로 취급
+                    max_shape.append(max_size)
+                max_shape = tuple(max_shape)
+                
+                # 모든 observation을 같은 shape으로 패딩
+                padded_obs = []
+                for arr in obs_arrays:
+                    # 차원 수가 부족한 경우 차원 추가
+                    while arr.ndim < max_ndim:
+                        arr = np.expand_dims(arr, axis=-1)
+                    
+                    # 각 차원별로 패딩 계산
+                    pad_width = []
+                    for dim in range(max_ndim):
+                        current_size = arr.shape[dim]
+                        pad_size = max_shape[dim] - current_size
+                        pad_width.append((0, pad_size))
+                    
+                    # Zero padding 적용
+                    padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=0)
+                    padded_obs.append(padded_arr)
+                
+                # 최종적으로 numpy array로 변환
+                step_data['observations'] = np.array(padded_obs)
+            else:
+                step_data['observations'] = np.array([])
+                
+        except Exception as e:
+            print(f'Step {step_id} - Failed to process observations: {e}')
+            print(f'Observation types: {[type(obs) for obs in current_obs] if "current_obs" in locals() else "N/A"}')
+            if 'obs_arrays' in locals():
+                print(f'Observation shapes: {[arr.shape for arr in obs_arrays]}')
+            step_data['observations'] = np.array([])
+
         self.step_data_buffer.append(step_data)
         
     def log_step_post(self, rewards, info):
@@ -343,7 +396,7 @@ def collect_data(env_id, num_episodes, seed):
             print(f"Env: {env_id} | Seed: {seed} | Episode {completed_episodes}: | [Overall Pick Rate={last_info.get('overall_pick_rate'):.2f}]| [Global return={last_info.get('global_episode_return'):.2f}]| [Total shelf deliveries={last_info.get('total_deliveries'):.2f}]| [Total clashes={last_info.get('total_clashes'):.2f}]| [Total stuck={last_info.get('total_stuck'):.2f}] | [FPS = {episode_length/(end-start):.2f}]")
             completed_episodes += 1
         except Exception as e:
-            print(f"Episode {seed+completed_episodes+failed_episodes}failed due to error: {e}")    
+            print(f"Episode {seed+completed_episodes+failed_episodes} failed due to error: {e}")    
             failed_episodes += 1
         # start = time.time()
         # # 수정: wrapper를 통해 episode 실행
@@ -362,7 +415,7 @@ def collect_data(env_id, num_episodes, seed):
 
 if __name__ == "__main__":
     environments = [
-        # 'tarware-tiny-3agvs-2pickers-partialobs-v1',
+        'tarware-tiny-3agvs-2pickers-partialobs-v1',
         'tarware-small-6agvs-3pickers-partialobs-v1', 
         'tarware-medium-10agvs-5pickers-partialobs-v1',
         'tarware-medium-19agvs-9pickers-partialobs-v1',

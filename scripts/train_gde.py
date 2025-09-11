@@ -257,8 +257,9 @@ class GraphConverter:
         self.graph_history.clear()
 
 class TrajectoryBatch:
-    graphs: Batch           # 현재 상태 그래프
-    next_positions: torch.Tensor  # [total_nodes, 2] 다음 스텝 위치
+    def __init__(self, graphs: Batch, next_positions: torch.Tensor):
+        self.graphs = graphs
+        self.next_positions = next_positions
 
 class WarehouseDataset(Dataset):
     def __init__(self, h5_file_path: str):
@@ -301,7 +302,7 @@ class WarehouseDataset(Dataset):
                     if self.node_dim is None:
                         self.node_dim = graph_data.x.size(1)
                         
-                    positions = self._extract_positions_from_observations(observations, num_agvs, num_pickers)
+                    positions = self._extract_positions_from_graph(graph_data, num_agvs, num_pickers)
                     step_data.append({
                         'graph': graph_data,
                         'positions': positions,
@@ -312,10 +313,7 @@ class WarehouseDataset(Dataset):
                     current_graph = step_data[i]['graph']
                     next_positions = step_data[i + 1]['positions']
                     
-                    self.sequences.append(TrajectoryBatch(
-                        graphs=current_graph,
-                        next_positions=next_positions
-                    ))
+                    self.sequences.append(TrajectoryBatch(current_graph, next_positions))
                     
         print(f"Loaded {len(self.sequences)} step pairs from {self.h5_file_path}")
         print(f"Node dimension: {self.node_dim}")
@@ -435,14 +433,14 @@ def check_h5_structure(file_path):
             else:
                 print(f"Dataset: {name}, shape: {obj.shape}")
         
-        f.visititems(print_structure)
+        # f.visititems(print_structure)
         
         # Episode 개수 확인
         episodes = [key for key in f.keys() if key.startswith('episode_')]
         print(f"Found episodes: {len(episodes)}")
         
         if episodes:
-            ep = f[episodes[0]]
+            ep = f[episodes[0 ]]
             if 'steps' in ep:
                 steps = list(ep['steps'].keys())
                 print(f"Steps in first episode: {len(steps)}")
@@ -488,23 +486,25 @@ if __name__ == "__main__":
     # ]
     parameters = {
         'num_epochs': 50,
-        'batch_size': 32,
+        'batch_size': 1,
         'lr': 1e-4,
         'weight_decay': 1e-5,
         }
-    seed = [0, 2000, 4000, 6000, 8000]
+    seed = [0, 1000, 2000, 3000, 4000]
     env = 'tarware-tiny-3agvs-2pickers-partialobs-v1'
     file_path = [f'./warehouse_data_{env}_seed{s}.h5' for s in seed]
-    dataset = ConcatDataset([WarehouseDataset(fp, episode_ids=list(range(10))) for fp in file_path])
+    check_h5_structure(file_path[0])
+    dataset = ConcatDataset([WarehouseDataset(fp) for fp in file_path])
     train_size = int(0.8 * len(dataset))
     val_size = int(0.2 * len(dataset))
     train_dataset, val_dataset= torch.utils.data.random_split(dataset, [train_size, val_size])
     print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     train_loader = DataLoader(train_dataset, batch_size=parameters['batch_size'], shuffle=True, collate_fn=collate_trajectory_batches)
     val_loader = DataLoader(val_dataset, batch_size=parameters['batch_size'], shuffle=False, collate_fn=collate_trajectory_batches)
-    
+    node_dim = train_dataset[0].graphs.x.size(1)
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = GraphODE(node_dim = dataset.node_dim, num_agvs=dataset.num_agvs, num_pickers=dataset.num_pickers, hidden_dim=64, ode_solver='euler')
+    model = GraphODE(node_dim = node_dim, num_agvs=3, num_pickers=2, hidden_dim=64, ode_solver='euler')
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=parameters['lr'], weight_decay=parameters['weight_decay'])
     
