@@ -435,13 +435,13 @@ if __name__ == "__main__":
     #     'tarware-large-15agvs-8pickers-partialobs-v1'
     # ]
     parameters = {
-        'num_epochs': 1000,
+        'num_epochs': 200,
         'batch_size': 32,
         'lr': 1e-3,
         'weight_decay': 1e-4,
         }
     seed = [0, 1000, 2000, 3000, 4000]
-    env = 'tarware-small-6agvs-3pickers-partialobs-v1'#'tarware-tiny-3agvs-2pickers-partialobs-v1'
+    env = 'tarware-medium-19agvs-9pickers-partialobs-v1' # 'tarware-small-6agvs-3pickers-partialobs-v1''tarware-tiny-3agvs-2pickers-partialobs-v1'
     file_path = [f'./warehouse_data_{env}_seed{s}.h5' for s in seed]
     # check_h5_structure(file_path[0])
     dataset = ConcatDataset([WarehouseDataset(fp) for fp in file_path])
@@ -464,13 +464,13 @@ if __name__ == "__main__":
     project="graph-ode-warehouse", 
     config=parameters,
     name=f"experiment_{env}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-)
+    )
+    best_val_loss = float('inf')
     for epoch in range(parameters['num_epochs']):
         # Training
         model.train()
         total_train_loss = 0
         num_train_batches = 0
-        best_val_loss = float('inf')
         for batch in train_loader:
             batch.graphs = batch.graphs.to(device)
             batch_next_positions = batch.next_positions.to(device)
