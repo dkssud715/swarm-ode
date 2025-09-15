@@ -1,3 +1,6 @@
+from datetime import datetime
+
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +9,7 @@ from torch_geometric.nn import HeteroConv, SAGEConv, GATConv, Linear
 from torch_geometric.data import HeteroData, Batch, Data
 # Import the converter from your code
 from torchdiffeq import odeint
+import wandb
 import h5py
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
@@ -140,9 +144,9 @@ class GraphConverter:
         
         # 8. Build global edge index
         all_edges = []
-        
         # 8a. Add all previous spatial edges (이미 저장된 것들은 global 인덱스로 변환)
-        for i, prev_graph in enumerate(self.graph_history[:-1]):  # 현재 제외
+        for i in range(len(self.graph_history) - 1):  # 현재 제외
+            prev_graph = self.graph_history[i]
             prev_spatial_edges = prev_graph.edge_index.clone()
             prev_timestep_offset = i * num_agents
             prev_spatial_edges += prev_timestep_offset
@@ -165,8 +169,17 @@ class GraphConverter:
         else:
             global_edge_index = torch.empty((2, 0), dtype=torch.long)
         
-        # 10. Create global graph
-        global_graph = Data(x=global_node_features, edge_index=global_edge_index)
+        # 10. Create node-level mask for current agents
+        total_nodes = global_node_features.size(0)
+        is_current_agent = torch.zeros(total_nodes, dtype=torch.bool)
+        
+        # 현재 timestep의 agent nodes만 True
+        current_start = current_timestep_offset
+        current_end = current_timestep_offset + num_agents
+        is_current_agent[current_start:current_end] = True
+
+        # 11. Create global graph
+        global_graph = Data(x=global_node_features, edge_index=global_edge_index, is_current_agent=is_current_agent)
         
         return global_graph
     
@@ -233,12 +246,16 @@ class GraphConverter:
     def _compute_temporal_edges_with_window(self, num_agents: int) -> torch.Tensor:
         """Compute temporal edges within the temporal window"""
         edges = []
-        current_timestep = len(self.graph_history)
         
-        if current_timestep > 0:
-            prev_timestep_offset = (current_timestep - 1) * num_agents
-            current_timestep_offset = current_timestep * num_agents
+        # Window 내에서의 현재 위치 (append 후이므로 마지막 위치)
+        current_window_position = len(self.graph_history) - 1
+        
+        if current_window_position > 0:
+            # 직전 timestep과의 연결만 (chain 형태)
+            prev_window_position = current_window_position - 1
             
+            prev_timestep_offset = prev_window_position * num_agents
+            current_timestep_offset = current_window_position * num_agents
             for agent_idx in range(num_agents):
                 prev_node_idx = prev_timestep_offset + agent_idx
                 current_node_idx = current_timestep_offset + agent_idx
@@ -248,7 +265,7 @@ class GraphConverter:
             return torch.empty((2, 0), dtype=torch.long)
         
         return torch.tensor(edges, dtype=torch.long).t()
-    
+
     def reset_history(self):
         """Reset the graph history (useful for new episodes)"""
         self.graph_history.clear()
@@ -357,70 +374,6 @@ def collate_trajectory_batches(batch_list: List[TrajectoryBatch]) -> TrajectoryB
         next_positions=next_positions
     )
 
-def train_graph_ode(model: GraphODE, train_loader: DataLoader, val_loader: DataLoader = None,
-                   num_epochs: int = 100, lr: float = 1e-3, device: str = 'cpu'):
-    """Training loop with proper batching"""
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    for epoch in range(num_epochs):
-        # Training
-        model.train()
-        total_train_loss = 0
-        num_train_batches = 0
-        
-        for batch in train_loader:
-            batch = batch.to_device(device)
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            result = model(batch.graph_data, batch.time_steps)
-            pred_trajectories = result['trajectories']  # [T, total_nodes, 2]
-            
-            # Reshape target trajectories to match prediction
-            # batch.trajectories: [B, T, N, 2] -> need to flatten to [T, B*N, 2]
-            B, T, N, _ = batch.trajectories.shape
-            target_trajectories = batch.trajectories.permute(1, 0, 2, 3).reshape(T, B * N, 2)
-            
-            # Compute loss
-            loss = F.mse_loss(pred_trajectories, target_trajectories)
-            
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            
-            total_train_loss += loss.item()
-            num_train_batches += 1
-        
-        avg_train_loss = total_train_loss / num_train_batches
-        
-        # Validation
-        val_loss = 0
-        if val_loader is not None:
-            model.eval()
-            with torch.no_grad():
-                total_val_loss = 0
-                num_val_batches = 0
-                
-                for batch in val_loader:
-                    batch = batch.to_device(device)
-                    result = model(batch.graph_data, batch.time_steps)
-                    pred_trajectories = result['trajectories']
-                    
-                    B, T, N, _ = batch.trajectories.shape
-                    target_trajectories = batch.trajectories.permute(1, 0, 2, 3).reshape(T, B * N, 2)
-                    
-                    loss = F.mse_loss(pred_trajectories, target_trajectories)
-                    total_val_loss += loss.item()
-                    num_val_batches += 1
-                
-                val_loss = total_val_loss / num_val_batches
-        
-        print(f"Epoch {epoch:3d} | Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss:.6f}")
-
 def check_h5_structure(file_path):
     with h5py.File(file_path, 'r') as f:
         print("File contents:")
@@ -482,15 +435,15 @@ if __name__ == "__main__":
     #     'tarware-large-15agvs-8pickers-partialobs-v1'
     # ]
     parameters = {
-        'num_epochs': 50,
-        'batch_size': 1,
-        'lr': 1e-4,
-        'weight_decay': 1e-5,
+        'num_epochs': 200,
+        'batch_size': 32,
+        'lr': 1e-3,
+        'weight_decay': 1e-4,
         }
     seed = [0, 1000, 2000, 3000, 4000]
-    env = 'tarware-tiny-3agvs-2pickers-partialobs-v1'
+    env = 'tarware-medium-19agvs-9pickers-partialobs-v1' # 'tarware-small-6agvs-3pickers-partialobs-v1''tarware-tiny-3agvs-2pickers-partialobs-v1'
     file_path = [f'./warehouse_data_{env}_seed{s}.h5' for s in seed]
-    check_h5_structure(file_path[0])
+    # check_h5_structure(file_path[0])
     dataset = ConcatDataset([WarehouseDataset(fp) for fp in file_path])
     train_size = int(0.8 * len(dataset))
     val_size = int(0.2 * len(dataset))
@@ -504,13 +457,20 @@ if __name__ == "__main__":
     model = GraphODE(node_dim = node_dim, num_agvs=3, num_pickers=2, hidden_dim=64, ode_solver='euler')
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=parameters['lr'], weight_decay=parameters['weight_decay'])
-    
+    save_model_path = f'./trained_models/{env}/{datetime.now().strftime("%Y%m%d_%H%M%S")}/'
+    if not os.path.exists(save_model_path):
+        os.makedirs(save_model_path)
+    wandb.init(
+    project="graph-ode-warehouse", 
+    config=parameters,
+    name=f"experiment_{env}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+    best_val_loss = float('inf')
     for epoch in range(parameters['num_epochs']):
         # Training
         model.train()
         total_train_loss = 0
         num_train_batches = 0
-        
         for batch in train_loader:
             batch.graphs = batch.graphs.to(device)
             batch_next_positions = batch.next_positions.to(device)
@@ -523,9 +483,11 @@ if __name__ == "__main__":
             result = model(batch.graphs, time_span)
             pred_trajectories = result['trajectories']  # [2, total_nodes, 2] (t=0, t=1)
             pred_next_positions = pred_trajectories[1]  # [total_nodes, 2] (t=1만 사용)
-            
+            mask = batch.graphs.is_current_agent
+            # current_predictions = pred_next_positions[mask]
+            # loss = F.mse_loss(current_predictions, batch.next_positions.view(-1, 2))
             # Compute loss: 예측 vs 실제 다음 위치
-            loss = F.mse_loss(pred_next_positions, batch.next_positions.view(-1, 2))
+            loss = F.mse_loss(pred_next_positions[mask], batch.next_positions.view(-1, 2))
             
             # Backward pass
             loss.backward()
@@ -552,11 +514,22 @@ if __name__ == "__main__":
                     time_span = torch.tensor([0., 1.], device=device)
                     result = model(batch.graphs, time_span)
                     pred_next_positions = result['trajectories'][1]
-                    
-                    loss = F.mse_loss(pred_next_positions, batch.next_positions.view(-1, 2))
+                    mask = batch.graphs.is_current_agent
+                    loss = F.mse_loss(pred_next_positions[mask], batch.next_positions.view(-1, 2))
                     total_val_loss += loss.item()
                     num_val_batches += 1
                 
                 val_loss = total_val_loss / num_val_batches
-            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), save_model_path + 'best_model.pth')
+                print(f"Saved best model at epoch {epoch} with val loss {best_val_loss:.6f}")
+            if epoch % 50 == 0:
+                torch.save(model.state_dict(), save_model_path + f'checkpoint_epoch{epoch}.pth')
+                print(f"Saved checkpoint at epoch {epoch}")
         print(f"Epoch {epoch:3d} | Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        wandb.log({
+            'epoch': epoch,
+            'train_loss': avg_train_loss,
+            'val_loss': val_loss
+        })
