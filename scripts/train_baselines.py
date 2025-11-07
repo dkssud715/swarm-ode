@@ -451,57 +451,81 @@ if __name__ == "__main__":
     }
     
     seeds = [0, 1000, 2000, 3000, 4000]
-    env = 'tarware-medium-19agvs-9pickers-partialobs-v1'
-    file_paths = [f'./warehouse_data_{env}_seed{s}.h5' for s in seeds]
-    
-    # Load dataset
-    print("Loading dataset...")
-    dataset = ConcatDataset([SequenceDataset(fp, seq_length=parameters['seq_length']) for fp in file_paths])
-    
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-    
-    train_loader = DataLoader(train_dataset, batch_size=parameters['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=parameters['batch_size'], shuffle=False)
-    
-    # Get dimensions from first sample
-    sample = train_dataset[0]
-    obs_dim = sample['observations'].shape[-1]
-    num_agents = sample['observations'].shape[-2]
-    
-    print(f"Observation dim: {obs_dim}, Number of agents: {num_agents}")
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    # Train all baseline models
-    models_to_train = [
-        ('GRU', GRUTrajectoryPredictor(obs_dim, num_agents, parameters['hidden_dim'], parameters['num_layers'])),
-        ('LSTM', LSTMTrajectoryPredictor(obs_dim, num_agents, parameters['hidden_dim'], parameters['num_layers'])),
-        ('GRU_PosOnly', PositionOnlyGRU(num_agents, parameters['hidden_dim'], parameters['num_layers'])),
-        ('LSTM_PosOnly', PositionOnlyLSTM(num_agents, parameters['hidden_dim'], parameters['num_layers']))
+    environments = [
+        'tarware-tiny-3agvs-2pickers-partialobs-v1',
+        'tarware-small-6agvs-3pickers-partialobs-v1', 
+        'tarware-medium-10agvs-5pickers-partialobs-v1',
+        # 'tarware-medium-19agvs-9pickers-partialobs-v1',
+        'tarware-large-15agvs-8pickers-partialobs-v1'
     ]
-    
-    for model_name, model in models_to_train:
+    for env in environments:
+        # env = 'tarware-medium-19agvs-9pickers-partialobs-v1'
+        file_paths = [f'./warehouse_data_{env}_seed{s}.h5' for s in seeds]
+        
+        # Load dataset
+        print("Loading dataset...")
+        dataset = ConcatDataset([SequenceDataset(fp, seq_length=parameters['seq_length']) for fp in file_paths])
+        
+        train_size = int(0.8 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+        
+        print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+        
+        train_loader = DataLoader(train_dataset, batch_size=parameters['batch_size'], shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=parameters['batch_size'], shuffle=False)
+        
+        # Get dimensions from first sample
+        sample = train_dataset[0]
+        obs_dim = sample['observations'].shape[-1]
+        num_agents = sample['observations'].shape[-2]
+        
+        print(f"Observation dim: {obs_dim}, Number of agents: {num_agents}")
+        
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        
+        # Train all baseline models
+        models_to_train = [
+            ('GRU', GRUTrajectoryPredictor(obs_dim, num_agents, parameters['hidden_dim'], parameters['num_layers'])),
+        #     ('LSTM', LSTMTrajectoryPredictor(obs_dim, num_agents, parameters['hidden_dim'], parameters['num_layers'])),
+        #     ('GRU_PosOnly', PositionOnlyGRU(num_agents, parameters['hidden_dim'], parameters['num_layers'])),
+        #     ('LSTM_PosOnly', PositionOnlyLSTM(num_agents, parameters['hidden_dim'], parameters['num_layers']))
+        ]
+        
+        for model_name, model in models_to_train:
+            print(f"\n{'='*60}")
+            print(f"Training {model_name}...")
+            print(f"{'='*60}\n")  
+            save_path = f'./trained_models/{env}/{model_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}/'
+            os.makedirs(save_path, exist_ok=True)
+            
+            trained_model = train_baseline_model(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                model_name=model_name,
+                parameters=parameters,
+                save_path=save_path,
+                device=device
+            )
+            
+            print(f"\nFinished training {model_name}")
+            print(f"Best model saved at: {save_path}")
+            
+            # 모델 학습 후 메모리 정리
+            del trained_model, model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            import gc
+            gc.collect()
+        
+        # 환경 하나 끝나면 데이터셋도 메모리 정리
+        del dataset, train_dataset, val_dataset, train_loader, val_loader, sample
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        import gc
+        gc.collect()
+        
         print(f"\n{'='*60}")
-        print(f"Training {model_name}...")
+        print(f"Finished environment: {env}")
+        print(f"Memory cleaned up")
         print(f"{'='*60}\n")
-        
-        save_path = f'./trained_models/{env}/{model_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}/'
-        os.makedirs(save_path, exist_ok=True)
-        
-        trained_model = train_baseline_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            model_name=model_name,
-            parameters=parameters,
-            save_path=save_path,
-            device=device
-        )
-        
-        print(f"\nFinished training {model_name}")
-        print(f"Best model saved at: {save_path}")
